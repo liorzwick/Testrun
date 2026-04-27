@@ -1,4 +1,4 @@
-name: One-Time CANSLIM Backtest (10 Years)
+name: One-Time CANSLIM Backtest
 
 on:
   workflow_dispatch: 
@@ -27,4 +27,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CANSLIM-Results
-          path: output/ 
+          path: output/
