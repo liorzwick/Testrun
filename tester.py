@@ -91,7 +91,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig)
     return pd.DataFrame()
 
 # ==========================================
-# 2. Universe
+# 2. Universe Handling
 # ==========================================
 def load_universe_membership(path: str | None): return None
 def ticker_allowed_on_date(ticker, dt, universe_df): return True
@@ -103,13 +103,22 @@ def market_filter_ok(spy_df: pd.DataFrame, current_date: pd.Timestamp) -> bool:
     x = spy_df[spy_df.index <= current_date]
     if len(x) < 220: return False
     last_row = x.iloc[-1]
-    # תיקון השגיאה: השוואת ערכים סקלריים (מספרים) ולא אובייקטים של פנדס
-    return float(last_row["Close"]) > float(last_row["SMA_200"])
+    # שימוש ב-.item() כדי להבטיח קבלת ערך בודד
+    close_val = float(last_row["Close"])
+    sma_val = float(last_row["SMA_200"])
+    return close_val > sma_val
 
 def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
-    if any(pd.isna(today[c]) for c in ["SMA_200", "Vol_50", "High_252"]): return False
-    if float(today["Close"]) < cfg.min_price or float(today["DollarVol_50"]) < cfg.min_dollar_vol_50: return False
-    dist_52w = (float(today["Close"]) / float(today["High_252"])) - 1.0
+    # תיקון השגיאה: הוספת .any() לביטוי ה-isna כדי למנוע כפל ערכים
+    for col in ["SMA_200", "Vol_50", "High_252"]:
+        if pd.isna(today[col]).any() if isinstance(today[col], pd.Series) else pd.isna(today[col]):
+            return False
+            
+    close_p = float(today["Close"])
+    if close_p < cfg.min_price or float(today["DollarVol_50"]) < cfg.min_dollar_vol_50: 
+        return False
+        
+    dist_52w = (close_p / float(today["High_252"])) - 1.0
     return dist_52w >= -cfg.max_dist_from_52w_high
 
 # ==========================================
@@ -128,6 +137,7 @@ def get_vcp_signal(pattern_data: pd.DataFrame, cfg: BacktestConfig):
     if len(handle_area) < cfg.min_handle_days: return None
     
     handle_low = float(handle_area["Low"].min())
+    # שפל עולה - סבלנות
     if handle_low <= cup_bottom * 1.015: return None 
     
     handle_depth = (rim_price - handle_low) / rim_price
@@ -145,18 +155,27 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
     highest_seen, stop_price = float(entry_price), float(initial_stop)
     
     for i, row in enumerate(future.itertuples()):
-        highest_seen = max(highest_seen, float(row.High))
+        day_low = float(row.Low)
+        day_high = float(row.High)
+        day_close = float(row.Close)
+        
+        highest_seen = max(highest_seen, day_high)
         profit = (highest_seen / entry_price) - 1
+        
+        # ניהול סטופ מדורג
         if profit >= 0.10: stop_price = max(stop_price, entry_price * 1.01)
         if profit >= 0.20: stop_price = max(stop_price, highest_seen * 0.88)
 
-        if float(row.Low) <= stop_price:
+        if day_low <= stop_price:
             exit_p = min(float(row.Open), stop_price) * (1 - cfg.slippage_bps/10000)
             return {"Exit_Date": row.Index, "Exit_Price": exit_p, "Exit_Reason": "StopHit", "Hold": i+1}
-        if i >= cfg.time_stop_bars and (float(row.Close)/entry_price-1) < cfg.min_profit_after_time_stop:
-            return {"Exit_Date": row.Index, "Exit_Price": float(row.Close), "Exit_Reason": "TimeExit", "Hold": i+1}
-        if i == cfg.early_exit_bars and (float(row.Close)/entry_price-1) < cfg.early_exit_min_progress:
-            return {"Exit_Date": row.Index, "Exit_Price": float(row.Close), "Exit_Reason": "EarlyFail", "Hold": i+1}
+            
+        if i >= cfg.time_stop_bars and (day_close/entry_price-1) < cfg.min_profit_after_time_stop:
+            return {"Exit_Date": row.Index, "Exit_Price": day_close, "Exit_Reason": "TimeExit", "Hold": i+1}
+            
+        if i == cfg.early_exit_bars and (day_close/entry_price-1) < cfg.early_exit_min_progress:
+            return {"Exit_Date": row.Index, "Exit_Price": day_close, "Exit_Reason": "EarlyFail", "Hold": i+1}
+            
     return {"Exit_Date": future.index[-1], "Exit_Price": float(future.iloc[-1].Close), "Exit_Reason": "MaxHold", "Hold": len(future)}
 
 # ==========================================
@@ -172,43 +191,58 @@ def generate_candidates(tickers, data_cache, spy_df, cfg):
             today = past.iloc[-1]
             if today.name.year < cfg.start_year or not market_filter_ok(spy_df, today.name): continue
             if not stock_filter_ok(today, cfg): continue
+            
             pattern = get_vcp_signal(past, cfg)
-            if pattern and float(today.Close) > pattern['pivot_price'] and float(past.iloc[-2].Close) <= pattern['pivot_price']:
-                if float(today.Close) <= pattern['pivot_price'] * (1+cfg.max_pivot_extension):
-                    if i+1 >= len(df): continue
-                    entry_p = float(df.iloc[i+1].Open) * (1+cfg.slippage_bps/10000)
-                    sim = simulate_trade(df, df.index[i+1], entry_p, max(pattern['handle_low'], entry_p*0.93), cfg)
-                    if sim:
-                        candidates.append({"Year": today.name.year, "Ticker": ticker, "Entry_Date": df.index[i+1], "Exit_Date": sim["Exit_Date"], "Entry_Price": entry_p, "Exit_Price": sim["Exit_Price"], "Pct": (sim["Exit_Price"]/entry_p-1)*100, "Reason": sim["Exit_Reason"]})
+            if pattern:
+                curr_close = float(today.Close)
+                prev_close = float(past.iloc[-2].Close)
+                if curr_close > pattern['pivot_price'] and prev_close <= pattern['pivot_price']:
+                    if curr_close <= pattern['pivot_price'] * (1+cfg.max_pivot_extension):
+                        if i+1 >= len(df): continue
+                        entry_p = float(df.iloc[i+1].Open) * (1+cfg.slippage_bps/10000)
+                        sim = simulate_trade(df, df.index[i+1], entry_p, max(pattern['handle_low'], entry_p*0.93), cfg)
+                        if sim:
+                            candidates.append({"Year": today.name.year, "Ticker": ticker, "Entry_Date": df.index[i+1], "Exit_Date": sim["Exit_Date"], "Entry_Price": entry_p, "Exit_Price": sim["Exit_Price"], "Pct": (sim["Exit_Price"]/entry_p-1)*100, "Reason": sim["Exit_Reason"]})
     return pd.DataFrame(candidates)
 
 # ==========================================
-# 7. Portfolio Management (REAL MONEY)
+# 7. Portfolio Management (Real Money Simulation)
 # ==========================================
 def accept_trades(candidates, data_cache, cfg):
     if candidates.empty: return pd.DataFrame()
     cash, active, accepted = cfg.initial_capital, [], []
     candidates = candidates.sort_values("Entry_Date")
+    
     for cand in candidates.to_dict("records"):
         dt = pd.Timestamp(cand["Entry_Date"])
-        # שחרור הון
+        # שחרור הון מעסקאות סגורות
         for p in active[:]:
             if pd.Timestamp(p["Exit_Date"]) < dt:
                 cash += p["Shares"] * p["Exit_Price"] * (1 - cfg.commission_bps/10000)
                 active.remove(p)
+                
         if len(active) >= cfg.max_positions: continue
-        # חישוב הון זמין כולל פוזיציות פתוחות
-        equity = cash + sum(float(data_cache[p["Ticker"]].loc[data_cache[p["Ticker"]].index <= dt].iloc[-1].Close) * p["Shares"] for p in active)
+        
+        # חישוב אקוויטי נוכחי להקצאה
+        current_mkt_val = 0
+        for p in active:
+            ticker_df = data_cache[p["Ticker"]]
+            curr_p = float(ticker_df.loc[ticker_df.index <= dt].iloc[-1].Close)
+            current_mkt_val += curr_p * p["Shares"]
+            
+        equity = cash + current_mkt_val
         shares = int(min(equity * cfg.max_alloc_pct, cash) / cand["Entry_Price"])
+        
         if shares > 0:
             cash -= shares * cand["Entry_Price"] * (1 + cfg.commission_bps/10000)
             cand["Shares"] = shares
             accepted.append(cand)
             active.append(cand)
+            
     return pd.DataFrame(accepted)
 
 # ==========================================
-# 8-13. Utils & Reporting
+# 8-13. Reporting & Core Execution
 # ==========================================
 def fetch_sp500():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -221,11 +255,11 @@ if __name__ == "__main__":
     cfg = BacktestConfig()
     tickers = fetch_sp500()
     spy = get_data("SPY", "2014-01-01", "2026-03-01", cfg)
-    # הרצה על מדגם של 200 מניות כדי למנוע קריסת זיכרון
-    data_cache = {t: get_data(t, "2014-01-01", "2026-03-01", cfg) for t in tqdm(tickers[:200], desc="Loading Data")}
+    # הרצה על מדגם של 150 מניות כדי למנוע קריסת זיכרון בשרת
+    data_cache = {t: get_data(t, "2014-01-01", "2026-03-01", cfg) for t in tqdm(tickers[:150], desc="Loading Data")}
     data_cache["SPY"] = spy
     
-    candidates = generate_candidates(tickers[:200], data_cache, spy, cfg)
+    candidates = generate_candidates(tickers[:150], data_cache, spy, cfg)
     accepted = accept_trades(candidates, data_cache, cfg)
     
     if not accepted.empty:
@@ -233,3 +267,5 @@ if __name__ == "__main__":
         print(f"\nFinal Report:\nTotal Trades: {len(accepted)}")
         print(f"Win Rate: {(accepted['Pct'] > 0).mean()*100:.1f}%")
         print(f"Avg Trade: {accepted['Pct'].mean():.2f}%")
+    else:
+        print("No trades found.")
