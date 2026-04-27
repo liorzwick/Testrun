@@ -883,7 +883,7 @@ if __name__ == "__main__":
         min_cup_days=25,           
         max_cup_days=180,
         max_pivot_extension=0.05,  
-        max_entry_extension: float=0.04,  
+        max_entry_extension=0.04,  
         max_gap_above_pivot=0.03,  
 
         min_breakout_close_strength=0.30, 
