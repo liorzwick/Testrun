@@ -19,43 +19,46 @@ class BacktestConfig:
     end_year: int = 2025
     benchmark: str = "SPY"
     initial_capital: float = 100_000.0
-    risk_per_trade: float = 0.004
-    max_alloc_pct: float = 0.08
-    max_positions: int = 6
-    max_portfolio_heat: float = 0.02
-    cooldown_days: int = 30
+    risk_per_trade: float = 0.005
+    max_alloc_pct: float = 0.12        # הוגדל קצת כדי לנצל את הסבלנות
+    max_positions: int = 8
+    max_portfolio_heat: float = 0.04
+    cooldown_days: int = 15
     slippage_bps: float = 12
     commission_bps: float = 2
-    breakout_volume_ratio: float = 1.5
+    breakout_volume_ratio: float = 1.1 
     min_dollar_vol_50: float = 25_000_000
     min_price: float = 15.0
-    min_risk_pct: float = 0.03
-    max_risk_pct: float = 0.06
-    max_hold_bars: int = 84
-    time_stop_bars: int = 15
-    min_profit_after_time_stop: float = 0.03
-    min_prior_uptrend: float = 0.20
-    min_cup_depth: float = 0.12
-    max_cup_depth: float = 0.33
+    
+    # --- התאמות לסטופ הדוק ---
+    min_risk_pct: float = 0.01         # נאפשר סטופ קרוב מאוד (1%) בלי לפסול את העסקה
+    max_risk_pct: float = 0.04         # מקסימום 4% סיכון לעסקה מהכניסה
+    
+    max_hold_bars: int = 120
+    time_stop_bars: int = 30
+    min_profit_after_time_stop: float = 0.01
+    min_prior_uptrend: float = 0.08
+    min_cup_depth: float = 0.04
+    max_cup_depth: float = 0.35
     max_handle_depth: float = 0.10
-    min_handle_days: int = 5
-    max_handle_days: int = 15
-    min_cup_days: int = 35
-    max_cup_days: int = 130
+    min_handle_days: int = 3
+    max_handle_days: int = 20
+    min_cup_days: int = 15
+    max_cup_days: int = 200
     max_pivot_extension: float = 0.03
-    max_entry_extension: float = 0.02
+    max_entry_extension: float = 0.03
     max_gap_above_pivot: float = 0.02
-    min_breakout_close_strength: float = 0.60
-    min_rs_65: float = 0.08
-    max_dist_from_52w_high: float = 0.10
-    early_exit_bars: int = 8
-    early_exit_min_progress: float = 0.02
-    min_tight_closes_in_handle: int = 2
+    min_breakout_close_strength: float = 0.30
+    min_rs_65: float = 0.00
+    max_dist_from_52w_high: float = 0.15
+    early_exit_bars: int = 10
+    early_exit_min_progress: float = -0.02
+    min_tight_closes_in_handle: int = 0
     use_point_in_time_universe: bool = False
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v8_patient"
+    output_prefix: str = "canslim_v9_vcp"
 
 # ==========================================
 # 1. Data & Caching
@@ -176,27 +179,33 @@ def market_filter_ok(spy_df: pd.DataFrame, current_date: pd.Timestamp) -> bool:
     row = x.iloc[-1]
     sma200_old = x["SMA_200"].iloc[-20]
 
-    if any(pd.isna(row[c]) for c in ["SMA_50", "SMA_150", "SMA_200", "ROC_20", "ROC_65"]) or pd.isna(sma200_old):
+    # תיקון השגיאות של הפנדס - any() כדי למנוע ambiguity 
+    if any(pd.isna(row[c]).any() if isinstance(row[c], pd.Series) else pd.isna(row[c]) for c in ["SMA_50", "SMA_150", "SMA_200", "ROC_20", "ROC_65"]):
+        return False
+    if pd.isna(sma200_old).any() if isinstance(sma200_old, pd.Series) else pd.isna(sma200_old):
         return False
 
     return (
-        row["Close"] > row["SMA_50"] > row["SMA_150"] > row["SMA_200"] and 
-        row["SMA_200"] > sma200_old and
-        row["ROC_20"] > -0.03 and 
-        row["ROC_65"] > 0
+        float(row["Close"]) > float(row["SMA_50"]) > float(row["SMA_150"]) > float(row["SMA_200"]) and 
+        float(row["SMA_200"]) > float(sma200_old) and
+        float(row["ROC_20"]) > -0.03 and 
+        float(row["ROC_65"]) > 0
     )
 
 def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     required = ["SMA_21", "SMA_50", "SMA_150", "SMA_200", "Vol_50", "ATR_14", "ATR_Pct", "ROC_65", "DollarVol_50", "High_252"]
-    if any(pd.isna(today[c]) for c in required): return False
+    
+    for c in required:
+        if pd.isna(today[c]).any() if isinstance(today[c], pd.Series) else pd.isna(today[c]):
+            return False
 
-    if today["Close"] < cfg.min_price: return False
-    if not (today["Close"] > today["SMA_21"] > today["SMA_50"] > today["SMA_150"] > today["SMA_200"]): return False
-    if today["ROC_65"] < cfg.min_prior_uptrend: return False
-    if today["DollarVol_50"] < cfg.min_dollar_vol_50: return False
-    if not (0.01 <= today["ATR_Pct"] <= 0.08): return False
+    if float(today["Close"]) < cfg.min_price: return False
+    if not (float(today["Close"]) > float(today["SMA_21"]) > float(today["SMA_50"]) > float(today["SMA_150"]) > float(today["SMA_200"])): return False
+    if float(today["ROC_65"]) < cfg.min_prior_uptrend: return False
+    if float(today["DollarVol_50"]) < cfg.min_dollar_vol_50: return False
+    if not (0.01 <= float(today["ATR_Pct"]) <= 0.08): return False
 
-    dist_52w = (today["Close"] / today["High_252"]) - 1.0
+    dist_52w = (float(today["Close"]) / float(today["High_252"])) - 1.0
     if dist_52w < -cfg.max_dist_from_52w_high: return False
 
     return True
@@ -282,9 +291,13 @@ def get_cup_handle_signal(pattern_data: pd.DataFrame, cfg: BacktestConfig):
 
     handle_low = float(handle["Low"].min())
     
-    # --- שפלים עולים (VCP) - התוספת המבוקשת ---
-    # מוודא שהשפל של הידית גבוה במעט מהשפל של הספל, ליצירת משולש עולה
-    if handle_low <= cup_low * 1.015: 
+    # --- שילוב המשולש השורי / VCP ---
+    # מוצא את אזור הכיווץ הממש אחרון (5 ימים אחרונים או פחות אם הידית קצרה)
+    last_tight_days = handle.tail(5) if len(handle) >= 5 else handle
+    tight_low = float(last_tight_days["Low"].min())
+    
+    # בדיקת שפל עולה ברור מול תחתית הספל
+    if tight_low <= cup_low * 1.02: 
         return None
 
     handle_depth_pct = (rim_price - handle_low) / rim_price
@@ -319,6 +332,7 @@ def get_cup_handle_signal(pattern_data: pd.DataFrame, cfg: BacktestConfig):
     return {
         "pivot_price": pivot,
         "handle_low": handle_low,
+        "tight_low": tight_low,  # הוספתי למילון כדי להשתמש בזה לסטופ ההדוק
         "cup_depth_pct": cup_depth_pct,
         "handle_depth_pct": handle_depth_pct,
         "cup_length": cup_len,
@@ -392,7 +406,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 
         if (i + 1) == cfg.early_exit_bars:
             progress = (day_close / entry_price) - 1.0
-            # הסרת ה"חניקה" של day_close < pivot, כדי לתת למניה לנשום אם היא עדיין מעל הסטופ
+            # הסרתי את החיתוך המוקדם אם day_close < pivot, כי הסטופ לוס ההדוק החדש כבר עושה את העבודה טוב יותר
             if progress < cfg.early_exit_min_progress:
                 final_exit_date = dt
                 final_exit_price = day_close * (1 - cfg.slippage_bps / 10000)
@@ -402,10 +416,11 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         profit_high = (highest_seen - entry_price) / entry_price
         new_stop = stop_today
         
-        # --- מנגנון ניהול סבלני במקום "חניקה" ---
-        if profit_high >= 0.08: new_stop = max(new_stop, entry_price * 1.005) # ברייק-איוון רק אחרי 8% רווח
-        if profit_high >= 0.15: new_stop = max(new_stop, highest_seen - 2.0 * atr_live) # נגרר
-        if profit_high >= 0.25: new_stop = max(new_stop, highest_seen - 1.5 * atr_live)
+        # --- ניהול הסטופ הסבלני ---
+        # ברייק-איוון רק אחרי שהפריצה מוכיחה את עצמה ממש
+        if profit_high >= 0.06: new_stop = max(new_stop, entry_price * 1.005)
+        if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.90)
+        if profit_high >= 0.25: new_stop = max(new_stop, highest_seen * 0.88)
 
         stop_next_day = max(stop_today, new_stop)
 
@@ -505,7 +520,15 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                 atr = float(today["ATR_14"])
                 if np.isnan(atr) or atr <= 0: continue
 
-                initial_stop = max(pattern["handle_low"], entry_price - 2 * atr)
+                # --- הסטופ לוס ההדוק ---
+                # הסטופ מונח קצת מתחת לנמוך של כיווץ הימים האחרונים (tight_low)
+                tight_low = float(pattern["tight_low"])
+                calculated_stop = tight_low * 0.99
+                # הגנה: הסטופ לא יכול להיות עמוק יותר מהמקסימום סיכון המותר (4%)
+                max_allowed_stop = entry_price * (1 - cfg.max_risk_pct)
+                
+                initial_stop = max(calculated_stop, max_allowed_stop)
+                
                 risk_pct = (entry_price - initial_stop) / entry_price
                 if not (cfg.min_risk_pct <= risk_pct <= cfg.max_risk_pct): continue
 
@@ -821,7 +844,7 @@ def save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, o
 
 def print_report(overall: dict, yearly_df: pd.DataFrame):
     print("\n" + "=" * 80)
-    print("CANSLIM v8 (Patient & VCP) - Backtest Report")
+    print("CANSLIM v9 (Patient & Tight VCP) - Backtest Report")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
@@ -860,49 +883,7 @@ def example_tickers() -> list[str]:
 # 13. Main
 # ==========================================
 if __name__ == "__main__":
-    cfg = BacktestConfig(
-        start_year=2015,
-        end_year=2025,
-        benchmark="SPY",
-        initial_capital=100_000,
-        risk_per_trade=0.005,
-        max_alloc_pct=0.12,        # הוגדל לסבלנות
-        max_positions=8,           
-        max_portfolio_heat=0.04,   
-        cooldown_days=20,          
-        slippage_bps=12,
-        commission_bps=2,
-
-        breakout_volume_ratio=1.1, 
-        min_prior_uptrend=0.08,    
-        min_cup_depth=0.08,        
-        max_cup_depth=0.45,        
-        max_handle_depth=0.15,     
-        min_handle_days=3,         
-        max_handle_days=20,
-        min_cup_days=25,           
-        max_cup_days=180,
-        max_pivot_extension=0.05,  
-        max_entry_extension=0.04,  
-        max_gap_above_pivot=0.03,  
-
-        min_breakout_close_strength=0.30, 
-        min_rs_65=0.00,                   
-        max_dist_from_52w_high=0.15,      
-        
-        # עדכון זמני סבלנות
-        early_exit_bars=15,               # 3 שבועות חסד
-        early_exit_min_progress=-0.04,    
-        time_stop_bars=45,                # חודשיים סבלנות
-        min_profit_after_time_stop=0.01,  
-        min_tight_closes_in_handle=0,     
-
-        use_point_in_time_universe=False, 
-        raw_price_mode=False,             
-        allow_same_day_cash_reuse=False,
-        universe_file=None,               
-        output_prefix="canslim_v8_patient",
-    )
+    cfg = BacktestConfig()
 
     tickers = fetch_sp500_tickers_current() if not cfg.use_point_in_time_universe else sorted(pd.read_csv(cfg.universe_file)["Ticker"].astype(str).str.upper().unique())
 
