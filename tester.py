@@ -21,27 +21,27 @@ class BacktestConfig:
     initial_capital: float = 100_000.0
     risk_per_trade: float = 0.005      
     
-    # ניהול תיק 
-    max_alloc_pct: float = 0.15        
-    max_positions: int = 8             
+    # חזרה להגדרות התיק המנצחות (פיזור של 10)
+    max_alloc_pct: float = 0.12        
+    max_positions: int = 10            
     max_portfolio_heat: float = 0.04   
     cooldown_days: int = 15
     slippage_bps: float = 12
     commission_bps: float = 2
     
     # מסנני שוק ופריצה
-    breakout_volume_ratio: float = 1.15 
+    breakout_volume_ratio: float = 1.1 
     min_dollar_vol_50: float = 25_000_000
     min_price: float = 15.0
     
-    # --- הסטופ החכם (השילוב המנצח) ---
+    # --- הסטופ לוס (הנוסחה מגרסה 15) ---
     min_risk_pct: float = 0.01         
-    max_risk_pct: float = 0.07         # מאפשרים עד 7% לסטופ הראשוני כדי לחמוק מרעשי עושי שוק
-    max_hold_bars: int = 250           # נותנים למנצחים לרוץ עד שנה
+    max_risk_pct: float = 0.045        
+    max_hold_bars: int = 120           
     time_stop_bars: int = 35           
     min_profit_after_time_stop: float = 0.01 
     
-    # פרמטרים של משולש עולה (VCP)
+    # פרמטרים גיאומטריים (VCP)
     min_prior_uptrend: float = 0.08    
     max_base_depth: float = 0.35       
     max_tightness_depth: float = 0.08  
@@ -49,12 +49,11 @@ class BacktestConfig:
     min_rs_65: float = 0.02            
     max_dist_from_52w_high: float = 0.15
     
-    # דיוק כניסה הגיוני (לא חנוק מדי)
     max_pivot_extension: float = 0.04  
-    max_entry_extension: float = 0.035 
-    max_gap_above_pivot: float = 0.02 
+    max_entry_extension: float = 0.03  
+    max_gap_above_pivot: float = 0.02
     
-    early_exit_bars: int = 15          
+    early_exit_bars: int = 10          
     early_exit_min_progress: float = -0.02 
     min_tight_closes_in_handle: int = 0
     
@@ -62,7 +61,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v19_smart_stops"
+    output_prefix: str = "canslim_v20_sweet_spot"
 
 # ==========================================
 # 1. Data & Indicators
@@ -107,7 +106,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v19.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v20.pkl"
 
     if cache_file.exists():
         return pd.read_pickle(cache_file)
@@ -150,11 +149,20 @@ def market_filter_ok(spy_df: pd.DataFrame, current_date: pd.Timestamp) -> bool:
     if len(x) < 220: return False
 
     row = x.iloc[-1]
+    sma200_old = x["SMA_200"].iloc[-20]
 
-    if any(pd.isna(row[c]).any() if isinstance(row[c], pd.Series) else pd.isna(row[c]) for c in ["SMA_50", "SMA_200"]):
+    if any(pd.isna(row[c]).any() if isinstance(row[c], pd.Series) else pd.isna(row[c]) for c in ["SMA_50", "SMA_150", "SMA_200", "ROC_20", "ROC_65"]):
+        return False
+    if pd.isna(sma200_old).any() if isinstance(sma200_old, pd.Series) else pd.isna(sma200_old):
         return False
 
-    return float(row["Close"]) > float(row["SMA_50"]) and float(row["SMA_50"]) > float(row["SMA_200"])
+    # חזרה למסנן השוק המנצח
+    return (
+        float(row["Close"]) > float(row["SMA_50"]) > float(row["SMA_150"]) > float(row["SMA_200"]) and 
+        float(row["SMA_200"]) > float(sma200_old) and
+        float(row["ROC_20"]) > -0.03 and 
+        float(row["ROC_65"]) > 0
+    )
 
 def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     required = ["SMA_21", "SMA_50", "SMA_150", "SMA_200", "Vol_50", "ATR_14", "ATR_Pct", "ROC_65", "DollarVol_50", "High_252"]
@@ -245,7 +253,7 @@ def compute_signal_score(pattern_score: float, rs_65: float, volume_ratio: float
     return round(pattern_score + rs_component + vol_component + near_high_component + cs_component, 4)
 
 # ==========================================
-# 5. Smart Trailing Stop & SMA 50 System
+# 5. Patient Trade Simulation (THE SWEET SPOT)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -258,80 +266,81 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 
     stop_today = float(initial_stop)
     stop_next_day = float(initial_stop)
+    
+    if stop_next_day >= entry_price:
+        stop_next_day = entry_price * 0.985 
+        
     highest_seen = float(entry_price)
     lowest_seen = float(entry_price)
 
     for i, row in enumerate(future.itertuples()):
-        day_low = float(row.Low)
+        dt = row.Index
+        day_open = float(row.Open)
         day_high = float(row.High)
+        day_low = float(row.Low)
         day_close = float(row.Close)
-        sma_50 = float(getattr(row, "SMA_50", 0.0))
-        atr_live = float(getattr(row, "ATR_14", entry_price * 0.02))
 
-        stop_today = stop_next_day
+        stop_today = initial_stop if i == 0 else stop_next_day
+
+        if day_open <= stop_today:
+            final_exit_price = day_open * (1 - cfg.slippage_bps / 10000)
+            gross_pct = (final_exit_price - entry_price) / entry_price * 100
+            net_pct = gross_pct - (2 * cfg.commission_bps / 100)
+            return {
+                "Exit_Date": dt, "Exit_Price": final_exit_price, "Exit_Reason": "GapStop", "Hold_Bars": i+1,
+                "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2),
+                "MAE_Pct": round((min(lowest_seen, day_open)/entry_price-1)*100, 2), "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)
+            }
+
+        if day_low <= stop_today:
+            final_exit_price = stop_today * (1 - cfg.slippage_bps / 10000)
+            gross_pct = (final_exit_price - entry_price) / entry_price * 100
+            net_pct = gross_pct - (2 * cfg.commission_bps / 100)
+            return {
+                "Exit_Date": dt, "Exit_Price": final_exit_price, "Exit_Reason": "StopHit", "Hold_Bars": i+1,
+                "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2),
+                "MAE_Pct": round((min(lowest_seen, day_low)/entry_price-1)*100, 2), "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)
+            }
+
         highest_seen = max(highest_seen, day_high)
         lowest_seen = min(lowest_seen, day_low)
-        profit = (highest_seen / entry_price) - 1
+        profit_high = (highest_seen - entry_price) / entry_price
+        
+        # --- חזרה למנגנון הניהול המוזהב של גרסה 15 ---
+        new_stop = stop_today
+        if profit_high >= 0.08: new_stop = max(new_stop, entry_price * 1.005) # ברייק-איוון ב-8%
+        if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.90) # סטופ נגרר של 10%
+        if profit_high >= 0.30: new_stop = max(new_stop, highest_seen * 0.85) # סטופ נגרר של 15% כשהיא טסה
 
-        # --- הסטופ המבני: נגרר 3 ATR מתחת לשיא כדי לחמוק מניעורים ---
-        if highest_seen > entry_price:
-            stop_next_day = max(stop_today, highest_seen - (3.0 * atr_live))
+        stop_next_day = max(stop_today, new_stop)
 
-        # מעבר לברייק-איוון רק כשיש רווח משמעותי שמגן עלינו
-        if profit >= 0.10:
-            stop_next_day = max(stop_next_day, entry_price * 1.005)
+        if (i + 1) == cfg.early_exit_bars:
+            if (day_close / entry_price) - 1.0 < cfg.early_exit_min_progress:
+                final_exit_price = day_close * (1 - cfg.slippage_bps / 10000)
+                gross_pct = (final_exit_price - entry_price) / entry_price * 100
+                return {
+                    "Exit_Date": dt, "Exit_Price": final_exit_price, "Exit_Reason": "EarlyFail", "Hold_Bars": i+1,
+                    "Pct_Change": round(gross_pct - (2 * cfg.commission_bps / 100), 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2),
+                    "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": 0.0
+                }
 
-        # פגיעה בסטופ-לוס (הראשוני או הנגרר)
-        if day_low <= stop_today:
-            exit_p = min(float(row.Open), stop_today) * (1 - cfg.slippage_bps/10000)
-            
-            gross_pct = (exit_p - entry_price) / entry_price * 100
-            net_pct = gross_pct - (2 * cfg.commission_bps / 100)
-            risk_per_share = max(entry_price - initial_stop, 1e-9)
-            r_multiple = (entry_price * net_pct / 100) / risk_per_share
-            
-            return {
-                "Exit_Date": row.Index, "Exit_Price": exit_p, "Exit_Reason": "StopHit", "Hold_Bars": i+1,
-                "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2), 
-                "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": round(r_multiple, 2)
-            }
+        if (i + 1) >= cfg.time_stop_bars:
+            if (day_close - entry_price) / entry_price < cfg.min_profit_after_time_stop:
+                final_exit_price = day_close * (1 - cfg.slippage_bps / 10000)
+                gross_pct = (final_exit_price - entry_price) / entry_price * 100
+                return {
+                    "Exit_Date": dt, "Exit_Price": final_exit_price, "Exit_Reason": "TimeExit", "Hold_Bars": i+1,
+                    "Pct_Change": round(gross_pct - (2 * cfg.commission_bps / 100), 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2),
+                    "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": 0.0
+                }
 
-        # --- חיתוך מנצחים רק אם שברו SMA 50 ---
-        if profit >= 0.15 and day_close < sma_50:
-            exit_p = day_close * (1 - cfg.slippage_bps/10000)
-            gross_pct = (exit_p - entry_price) / entry_price * 100
-            net_pct = gross_pct - (2 * cfg.commission_bps / 100)
-            return {
-                "Exit_Date": row.Index, "Exit_Price": exit_p, "Exit_Reason": "SMA50_Exit", "Hold_Bars": i+1,
-                "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2), 
-                "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)
-            }
-
-        # יציאות על זמן ושעמום
-        if i >= cfg.time_stop_bars and (day_close/entry_price-1) < cfg.min_profit_after_time_stop:
-            exit_p = day_close * (1 - cfg.slippage_bps/10000)
-            gross_pct = (exit_p - entry_price) / entry_price * 100
-            return {
-                "Exit_Date": row.Index, "Exit_Price": exit_p, "Exit_Reason": "TimeExit", "Hold_Bars": i+1,
-                "Pct_Change": round(gross_pct - (2 * cfg.commission_bps / 100), 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2), 
-                "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": 0.0
-            }
-
-        if i == cfg.early_exit_bars and (day_close/entry_price-1) < cfg.early_exit_min_progress:
-            exit_p = day_close * (1 - cfg.slippage_bps/10000)
-            gross_pct = (exit_p - entry_price) / entry_price * 100
-            return {
-                "Exit_Date": row.Index, "Exit_Price": exit_p, "Exit_Reason": "EarlyFail", "Hold_Bars": i+1,
-                "Pct_Change": round(gross_pct - (2 * cfg.commission_bps / 100), 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2), 
-                "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": 0.0
-            }
-
-    exit_p = float(future.iloc[-1].Close)
-    gross_pct = (exit_p - entry_price) / entry_price * 100
+    final_exit_price = float(future.iloc[-1]["Close"]) * (1 - cfg.slippage_bps / 10000)
+    gross_pct = (final_exit_price - entry_price) / entry_price * 100
+    net_pct = gross_pct - (2 * cfg.commission_bps / 100)
     return {
-        "Exit_Date": future.index[-1], "Exit_Price": exit_p, "Exit_Reason": "MaxHold", "Hold_Bars": len(future),
-        "Pct_Change": round(gross_pct - (2 * cfg.commission_bps / 100), 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2), 
-        "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": 0.0
+        "Exit_Date": future.index[-1], "Exit_Price": final_exit_price, "Exit_Reason": "MaxHold", "Hold_Bars": len(future),
+        "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2),
+        "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)
     }
 
 # ==========================================
@@ -339,7 +348,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, universe_df=None):
     candidates = []
-    print("\nScanning for Ascending Triangle signals (Smart Structural Stops)...")
+    print("\nScanning for Ascending Triangle signals (V20 - The Sweet Spot)...")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -409,17 +418,12 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                 atr = float(today["ATR_14"])
                 if np.isnan(atr) or atr <= 0: continue
 
-                # --- הסטופ ההגיוני (מתחת לבסיס האחרון + הגנת ATR) ---
+                # חזרה לסטופ המוזהב: שפל הבסיס פחות חצי ATR בלבד
                 tight_low = float(pattern["tight_low"])
-                calculated_stop = tight_low - atr 
+                calculated_stop = tight_low - (0.5 * atr) 
                 max_allowed_stop = entry_price * (1 - cfg.max_risk_pct)
-                
-                # אנחנו לוקחים את הגבוה (ההדוק מביניהם) כדי למנוע הפסדים גדולים
                 initial_stop = max(calculated_stop, max_allowed_stop)
                 
-                if initial_stop >= entry_price:
-                    initial_stop = entry_price * 0.985
-                    
                 risk_pct = (entry_price - initial_stop) / entry_price
                 if not (cfg.min_risk_pct <= risk_pct <= cfg.max_risk_pct): continue
 
@@ -709,7 +713,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("ASCENDING TRIANGLE BACKTEST REPORT (v19 - Structural Stops)")
+    print("ASCENDING TRIANGLE BACKTEST REPORT (v20 - The Sweet Spot)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
