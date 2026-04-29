@@ -22,10 +22,8 @@ class BacktestConfig:
     initial_capital: float = 100_000.0
     risk_per_trade: float = 0.005      
     
-    # --- קובץ מניות אישי בלבד ---
     custom_tickers_file: str = "mystock.csv" 
     
-    # הגדרות התיק המנצחות
     max_alloc_pct: float = 0.12        
     max_positions: int = 10            
     max_portfolio_heat: float = 0.04   
@@ -33,31 +31,31 @@ class BacktestConfig:
     slippage_bps: float = 12
     commission_bps: float = 2
     
-    # --- 3 הדרישות החדשות לסריקה של 2000 מניות ---
-    breakout_volume_ratio: float = 1.1 
-    min_dollar_vol_50: float = 50_000_000 # דרישה 1: רק מניות עם נזילות כבדה של 50 מיליון דולר ביום
-    min_price: float = 20.0               # דרישה 2: חסימת מניות זולות ותנודתיות שמעיפות סטופים
+    # מסנני שוק למניות צמיחה
+    breakout_volume_ratio: float = 1.15 
+    min_dollar_vol_50: float = 30_000_000 
+    min_price: float = 15.0               
     
-    # הסטופ לוס (הנוסחה המנצחת של V15)
-    min_risk_pct: float = 0.01         
-    max_risk_pct: float = 0.045        
-    max_hold_bars: int = 120           
-    time_stop_bars: int = 35           
+    # --- מערכת הסיכון החדשה למניות תנודתיות (V25) ---
+    min_risk_pct: float = 0.02         
+    max_risk_pct: float = 0.08         # הוגדל ל-8% כדי לא לפסול את הפריצות האגרסיביות ביותר
+    max_hold_bars: int = 250           
+    time_stop_bars: int = 25           
     min_profit_after_time_stop: float = 0.01 
     
     # פרמטרים גיאומטריים (VCP)
     min_prior_uptrend: float = 0.08    
     max_base_depth: float = 0.35       
     max_tightness_depth: float = 0.08  
-    min_breakout_close_strength: float = 0.30
-    min_rs_65: float = 0.06               # דרישה 3: רק מנהיגות שוק חזקות שמכות את ה-SPY ב-6% לפחות
+    min_breakout_close_strength: float = 0.40
+    min_rs_65: float = 0.04            
     max_dist_from_52w_high: float = 0.15
     
     max_pivot_extension: float = 0.04  
     max_entry_extension: float = 0.03  
     max_gap_above_pivot: float = 0.02
     
-    early_exit_bars: int = 10          
+    early_exit_bars: int = 12          
     early_exit_min_progress: float = -0.02 
     min_tight_closes_in_handle: int = 0
     
@@ -65,7 +63,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v24_strict_universe"
+    output_prefix: str = "canslim_v25_growth_stocks"
 
 # ==========================================
 # 1. Data & Indicators
@@ -110,7 +108,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v24.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v25.pkl"
 
     if cache_file.exists():
         return pd.read_pickle(cache_file)
@@ -256,7 +254,7 @@ def compute_signal_score(pattern_score: float, rs_65: float, volume_ratio: float
     return round(pattern_score + rs_component + vol_component + near_high_component + cs_component, 4)
 
 # ==========================================
-# 5. Patient Trade Simulation
+# 5. Patient Trade Simulation (Growth Stock Logic)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -270,9 +268,6 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
     stop_today = float(initial_stop)
     stop_next_day = float(initial_stop)
     
-    if stop_next_day >= entry_price:
-        stop_next_day = entry_price * 0.985 
-        
     highest_seen = float(entry_price)
     lowest_seen = float(entry_price)
 
@@ -309,10 +304,13 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         lowest_seen = min(lowest_seen, day_low)
         profit_high = (highest_seen - entry_price) / entry_price
         
+        # --- ניהול פוזיציה שמותאם למניות קופצניות ---
         new_stop = stop_today
-        if profit_high >= 0.08: new_stop = max(new_stop, entry_price * 1.005) 
-        if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.90) 
-        if profit_high >= 0.30: new_stop = max(new_stop, highest_seen * 0.85) 
+        # נותנים למניה לעלות 12% לפני שחונקים אותה לברייק איוון
+        if profit_high >= 0.12: new_stop = max(new_stop, entry_price * 1.01) 
+        # טריילינג רחב שנותן מקום לתיקונים טבעיים של מניות צמיחה (15% מרווח)
+        if profit_high >= 0.20: new_stop = max(new_stop, highest_seen * 0.85) 
+        if profit_high >= 0.40: new_stop = max(new_stop, highest_seen * 0.80) 
 
         stop_next_day = max(stop_today, new_stop)
 
@@ -420,9 +418,12 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                 atr = float(today["ATR_14"])
                 if np.isnan(atr) or atr <= 0: continue
 
+                # --- סטופ לוס עם מרווח נשימה מלא של ATR ---
                 tight_low = float(pattern["tight_low"])
-                calculated_stop = tight_low - (0.5 * atr) 
+                calculated_stop = tight_low - atr 
                 max_allowed_stop = entry_price * (1 - cfg.max_risk_pct)
+                
+                # בוחרים את הגבוה מביניהם כדי לא לחרוג מ-8% הפסד
                 initial_stop = max(calculated_stop, max_allowed_stop)
                 
                 risk_pct = (entry_price - initial_stop) / entry_price
@@ -714,7 +715,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("BROAD MARKET VCP BACKTEST REPORT (v24 - Strict Universe)")
+    print("GROWTH STOCKS VCP BACKTEST REPORT (v25 - Broad Market Unlocked)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
@@ -758,10 +759,7 @@ def get_tickers(cfg: BacktestConfig):
 # ==========================================
 if __name__ == "__main__":
     cfg = BacktestConfig()
-    
     tickers = get_tickers(cfg)
-    
     cands, acc, eq, yearly, monthly, overall = run_backtest_engine(tickers, cfg)
-    
     save_outputs(cands, acc, eq, yearly, monthly, overall, cfg)
     print_final_report(overall, yearly)
