@@ -21,11 +21,11 @@ class BacktestConfig:
     initial_capital: float = 100_000.0
     risk_per_trade: float = 0.005      
     
-    # --- אגרסיביות וריכוזיות ---
-    max_alloc_pct: float = 0.20        # 20% מהתיק לכל מניה (הכפלת הכוח!)
-    max_positions: int = 5             # מקסימום 5 פוזיציות פתוחות במקביל
-    
+    # --- ניהול התיק (פיזור והגנות) ---
+    max_alloc_pct: float = 0.12        # עד 12% מהתיק למניה אחת
+    max_positions: int = 10            # מקסימום 10 מניות במקביל (אכיפה קשוחה)
     max_portfolio_heat: float = 0.04   
+    
     cooldown_days: int = 15
     slippage_bps: float = 12
     commission_bps: float = 2
@@ -34,24 +34,24 @@ class BacktestConfig:
     min_dollar_vol_50: float = 25_000_000
     min_price: float = 15.0
     
-    # ניהול טרייד
+    # ניהול טרייד - סטופ הדוק ותנועה חופשית למנצחים
     min_risk_pct: float = 0.01         
     max_risk_pct: float = 0.06         
-    max_hold_bars: int = 250           # נותנים למניה לרוץ עד שנה שלמה
+    max_hold_bars: int = 250           
     time_stop_bars: int = 35           
     min_profit_after_time_stop: float = 0.01 
     
-    # פרמטרים גיאומטריים של משולש עולה (VCP)
+    # פרמטרים של VCP (משולש עולה)
     min_prior_uptrend: float = 0.08    
-    max_base_depth: float = 0.45       # מאפשרים ירידה של עד 45% (כדי לתפוס התאוששויות ממשברים)
-    max_tightness_depth: float = 0.08  # הכיווץ הסופי חייב להיות הדוק (8%)
+    max_base_depth: float = 0.35       
+    max_tightness_depth: float = 0.08  
     min_breakout_close_strength: float = 0.30
-    min_rs_65: float = 0.02            # עוצמה יחסית: חייבת להכות את המדד ב-2%
+    min_rs_65: float = 0.02            # חובה עוצמה יחסית חיובית מול השוק
     max_dist_from_52w_high: float = 0.15
     
     min_cup_depth: float = 0.04
-    max_cup_depth: float = 0.45
-    max_handle_depth: float = 0.12
+    max_cup_depth: float = 0.35
+    max_handle_depth: float = 0.10
     min_handle_days: int = 3
     max_handle_days: int = 20
     min_cup_days: int = 15
@@ -68,7 +68,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v14_sniper"
+    output_prefix: str = "canslim_v15_triangle"
 
 # ==========================================
 # 1. Data & Indicators
@@ -85,40 +85,28 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     df = df[~df.index.duplicated(keep='first')]
 
-    df["SMA_21"] = df["Close"].rolling(21).mean()
     df["SMA_50"] = df["Close"].rolling(50).mean()
     df["SMA_150"] = df["Close"].rolling(150).mean()
     df["SMA_200"] = df["Close"].rolling(200).mean()
-    df["Vol_10"] = df["Volume"].rolling(10).mean()
     df["Vol_50"] = df["Volume"].rolling(50).mean()
-
     df["DollarVol_50"] = df["Close"].rolling(50).mean() * df["Volume"].rolling(50).mean()
     df["Prev_Close"] = df["Close"].shift(1)
-    df["ROC_20"] = df["Close"].pct_change(20)
     df["ROC_65"] = df["Close"].pct_change(65)
     df["High_252"] = df["High"].rolling(252).max()
-    df["Low_10"] = df["Low"].rolling(10).min()
-
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - df["Prev_Close"]).abs(),
-        (df["Low"] - df["Prev_Close"]).abs(),
-    ], axis=1).max(axis=1)
+    tr = pd.concat([df["High"] - df["Low"], (df["High"] - df["Prev_Close"]).abs(), (df["Low"] - df["Prev_Close"]).abs()], axis=1).max(axis=1)
     df["ATR_14"] = tr.rolling(14).mean()
-    df["ATR_Pct"] = df["ATR_14"] / df["Close"]
-
     return df
 
-def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig, retries: int = 3) -> pd.DataFrame:
+def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig) -> pd.DataFrame:
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
-    price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v14.pkl"
+    # קובץ v15 כדי למנוע קריסה מנתונים ישנים ופגומים
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_v15.pkl"
 
     if cache_file.exists():
         return pd.read_pickle(cache_file)
 
-    for _ in range(retries):
+    for _ in range(3):
         try:
             df = yf.Ticker(ticker).history(
                 start=start_fetch,
@@ -137,53 +125,11 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     return pd.DataFrame()
 
 # ==========================================
-# 2. Universe membership
+# 2. Universe Handling
 # ==========================================
-def load_universe_membership(path: str | None) -> pd.DataFrame | None:
-    if path is None:
-        return None
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Universe file not found: {path}")
-    u = pd.read_csv(p)
-    cols = {c.lower(): c for c in u.columns}
-    if "ticker" not in cols:
-        raise ValueError("Universe file must include a 'Ticker' column")
-
-    out = u.copy()
-    for c in ["start_date", "end_date"]:
-        if c in cols:
-            out[cols[c]] = pd.to_datetime(out[cols[c]])
-    if "year" in cols:
-        out[cols["year"]] = out[cols["year"]].astype(int)
-    return out
-
-def ticker_allowed_on_date(ticker: str, dt: pd.Timestamp, universe_df: pd.DataFrame | None) -> bool:
-    if universe_df is None: return True
-    cols = {c.lower(): c for c in universe_df.columns}
-    tcol = cols["ticker"]
-    sub = universe_df[universe_df[tcol].astype(str).str.upper() == ticker.upper()]
-    if sub.empty: return False
-
-    if "year" in cols:
-        return bool((sub[cols["year"]] == dt.year).any())
-    if "start_date" in cols and "end_date" in cols:
-        return bool(((sub[cols["start_date"]] <= dt) & (sub[cols["end_date"]] >= dt)).any())
-    return True
-
-def get_sector_for_ticker(ticker: str, dt: pd.Timestamp, universe_df: pd.DataFrame | None) -> str:
-    if universe_df is None: return "UNKNOWN"
-    cols = {c.lower(): c for c in universe_df.columns}
-    if "sector" not in cols: return "UNKNOWN"
-    tcol = cols["ticker"]
-    sub = universe_df[universe_df[tcol].astype(str).str.upper() == ticker.upper()].copy()
-    if sub.empty: return "UNKNOWN"
-    if "year" in cols:
-        sub = sub[sub[cols["year"]] == dt.year]
-    elif "start_date" in cols and "end_date" in cols:
-        sub = sub[(sub[cols["start_date"]] <= dt) & (sub[cols["end_date"]] >= dt)]
-    if sub.empty: return "UNKNOWN"
-    return str(sub.iloc[0][cols["sector"]])
+def load_universe_membership(path: str | None): return None
+def ticker_allowed_on_date(ticker, dt, universe_df): return True
+def get_sector_for_ticker(ticker, dt, universe_df): return "UNKNOWN"
 
 # ==========================================
 # 3. Filters
@@ -191,57 +137,24 @@ def get_sector_for_ticker(ticker: str, dt: pd.Timestamp, universe_df: pd.DataFra
 def market_filter_ok(spy_df: pd.DataFrame, current_date: pd.Timestamp) -> bool:
     x = spy_df[spy_df.index <= current_date]
     if len(x) < 220: return False
-
-    row = x.iloc[-1]
-    sma200_old = x["SMA_200"].iloc[-20]
-
-    if any(pd.isna(row[c]).any() if isinstance(row[c], pd.Series) else pd.isna(row[c]) for c in ["SMA_50", "SMA_150", "SMA_200", "ROC_20", "ROC_65"]):
-        return False
-    if pd.isna(sma200_old).any() if isinstance(sma200_old, pd.Series) else pd.isna(sma200_old):
-        return False
-
-    return (
-        float(row["Close"]) > float(row["SMA_50"]) > float(row["SMA_150"]) > float(row["SMA_200"]) and 
-        float(row["SMA_200"]) > float(sma200_old) and
-        float(row["ROC_20"]) > -0.03 and 
-        float(row["ROC_65"]) > 0
-    )
+    last_row = x.iloc[-1]
+    return float(last_row["Close"]) > float(last_row["SMA_200"])
 
 def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
-    required = ["SMA_21", "SMA_50", "SMA_150", "SMA_200", "Vol_50", "ATR_14", "ATR_Pct", "ROC_65", "DollarVol_50", "High_252"]
-    
-    for c in required:
-        if pd.isna(today[c]).any() if isinstance(today[c], pd.Series) else pd.isna(today[c]):
+    for col in ["SMA_200", "Vol_50", "High_252"]:
+        if pd.isna(today[col]).any() if isinstance(today[col], pd.Series) else pd.isna(today[col]):
             return False
 
-    if float(today["Close"]) < cfg.min_price: return False
-    if not (float(today["Close"]) > float(today["SMA_21"]) > float(today["SMA_50"]) > float(today["SMA_150"]) > float(today["SMA_200"])): return False
-    if float(today["DollarVol_50"]) < cfg.min_dollar_vol_50: return False
-    if not (0.01 <= float(today["ATR_Pct"]) <= 0.08): return False
+    close_p = float(today["Close"])
+    if close_p < cfg.min_price or float(today["DollarVol_50"]) < cfg.min_dollar_vol_50: 
+        return False
 
-    dist_52w = (float(today["Close"]) / float(today["High_252"])) - 1.0
-    if dist_52w < -cfg.max_dist_from_52w_high: return False
-
-    return True
+    dist_52w = (close_p / float(today["High_252"])) - 1.0
+    return dist_52w >= -cfg.max_dist_from_52w_high
 
 # ==========================================
-# 4. Pattern detection (Ascending Triangle)
+# 4. Pattern Detection (Ascending Triangle)
 # ==========================================
-def today_close_distance_to_pivot(close_price: float, pivot: float) -> float:
-    if pivot <= 0: return 0.0
-    d = abs(close_price / pivot - 1.0)
-    return max(0.0, 0.05 - d)
-
-def handle_tightness_score(handle: pd.DataFrame) -> float:
-    if len(handle) < 3: return 0.0
-    tight = 0
-    for i in range(1, len(handle)):
-        prev_c = float(handle["Close"].iloc[i - 1])
-        cur_c = float(handle["Close"].iloc[i])
-        if prev_c > 0 and abs(cur_c / prev_c - 1.0) <= 0.012:
-            tight += 1
-    return tight / max(len(handle) - 1, 1)
-
 def get_ascending_triangle_signal(pattern_data: pd.DataFrame, cfg: BacktestConfig):
     recent = pattern_data.tail(150)
     if len(recent) < 60: return None
@@ -292,7 +205,6 @@ def get_ascending_triangle_signal(pattern_data: pd.DataFrame, cfg: BacktestConfi
 
     return {
         "pivot_price": pivot, 
-        "handle_low": valley1_price,
         "tight_low": valley2_price,
         "cup_depth_pct": base_depth,
         "handle_depth_pct": tightness,
@@ -311,7 +223,7 @@ def compute_signal_score(pattern_score: float, rs_65: float, volume_ratio: float
     return round(pattern_score + rs_component + vol_component + near_high_component + cs_component, 4)
 
 # ==========================================
-# 5. Trade simulation (SMA 50 Let Winners Run)
+# 5. Patient Trade Simulation (FULL VERSION)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -322,52 +234,97 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
     future = df[df.index >= entry_date].head(cfg.max_hold_bars)
     if future.empty: return None
 
-    stop_price = float(initial_stop)
-    highest_seen = float(entry_price)
+    stop_today = float(initial_stop)
+    stop_next_day = float(initial_stop)
     
-    if stop_price >= entry_price:
-        stop_price = entry_price * 0.985
+    if stop_next_day >= entry_price:
+        stop_next_day = entry_price * 0.985 
+        
+    highest_seen = float(entry_price)
+    lowest_seen = float(entry_price)
+    mfe_pct = 0.0
+    mae_pct = 0.0
+
+    final_exit_date = future.index[-1]
+    final_exit_price = float(future.iloc[-1]["Close"]) * (1 - cfg.slippage_bps / 10000)
+    exit_reason = "MaxHold"
 
     for i, row in enumerate(future.itertuples()):
-        day_low = float(row.Low)
+        dt = row.Index
+        day_open = float(row.Open)
         day_high = float(row.High)
+        day_low = float(row.Low)
         day_close = float(row.Close)
-        sma_50 = float(getattr(row, "SMA_50", 0.0))
+
+        stop_today = initial_stop if i == 0 else stop_next_day
+
+        if day_open <= stop_today:
+            final_exit_date = dt
+            final_exit_price = day_open * (1 - cfg.slippage_bps / 10000)
+            exit_reason = "GapStop"
+            lowest_seen = min(lowest_seen, day_open)
+            mae_pct = min(mae_pct, (lowest_seen - entry_price) / entry_price * 100)
+            break
+
+        if day_low <= stop_today:
+            final_exit_date = dt
+            final_exit_price = stop_today * (1 - cfg.slippage_bps / 10000)
+            exit_reason = "StopHit"
+            lowest_seen = min(lowest_seen, day_low)
+            mae_pct = min(mae_pct, (lowest_seen - entry_price) / entry_price * 100)
+            break
 
         highest_seen = max(highest_seen, day_high)
-        profit = (highest_seen / entry_price) - 1
+        lowest_seen = min(lowest_seen, day_low)
+        mfe_pct = max(mfe_pct, (highest_seen - entry_price) / entry_price * 100)
+        mae_pct = min(mae_pct, (lowest_seen - entry_price) / entry_price * 100)
 
-        # --- מנגנון ניהול חכם וחדש ---
-        # 1. מזיזים את הסטופ לברייק-איוון (מחיר כניסה) אם המניה עולה קצת
-        if profit >= 0.08: 
-            stop_price = max(stop_price, entry_price * 1.01)
+        if (i + 1) == cfg.early_exit_bars:
+            progress = (day_close / entry_price) - 1.0
+            if progress < cfg.early_exit_min_progress:
+                final_exit_date = dt
+                final_exit_price = day_close * (1 - cfg.slippage_bps / 10000)
+                exit_reason = "EarlyFail"
+                break
 
-        # 2. עצירת הפסד רגילה או ברייק-איוון נפגעו
-        if day_low <= stop_price:
-            exit_p = min(float(row.Open), stop_price) * (1 - cfg.slippage_bps/10000)
-            return {"Exit_Date": row.Index, "Exit_Price": exit_p, "Exit_Reason": "StopHit", "Hold": i+1}
+        profit_high = (highest_seen - entry_price) / entry_price
+        new_stop = stop_today
+        
+        # --- מנגנון תנו למנצחים לרוץ ---
+        if profit_high >= 0.08: new_stop = max(new_stop, entry_price * 1.005) 
+        if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.90) 
+        if profit_high >= 0.30: new_stop = max(new_stop, highest_seen * 0.85) 
 
-        # 3. SMA 50 EXIT (מיועד רק למנצחים גדולים שרצים)
-        # אם יש לנו רווח של מעל 15%, ואנחנו סוגרים מתחת לממוצע הנע 50, מוכרים הכל!
-        if profit >= 0.15 and day_close < sma_50:
-            exit_p = day_close * (1 - cfg.slippage_bps/10000)
-            return {"Exit_Date": row.Index, "Exit_Price": exit_p, "Exit_Reason": "SMA50_Exit", "Hold": i+1}
+        stop_next_day = max(stop_today, new_stop)
 
-        # חיתוך זמן (שעמום)
-        if i >= cfg.time_stop_bars and (day_close/entry_price-1) < cfg.min_profit_after_time_stop:
-            return {"Exit_Date": row.Index, "Exit_Price": day_close, "Exit_Reason": "TimeExit", "Hold": i+1}
+        if (i + 1) >= cfg.time_stop_bars:
+            if (day_close - entry_price) / entry_price < cfg.min_profit_after_time_stop:
+                final_exit_date = dt
+                final_exit_price = day_close * (1 - cfg.slippage_bps / 10000)
+                exit_reason = "TimeExit"
+                break
 
-        # פריצת שווא
-        if i == cfg.early_exit_bars and (day_close/entry_price-1) < cfg.early_exit_min_progress:
-            return {"Exit_Date": row.Index, "Exit_Price": day_close, "Exit_Reason": "EarlyFail", "Hold": i+1}
+    # חישובי אחוזי רווח/הפסד לתצוגה בטבלאות
+    gross_pct = (final_exit_price - entry_price) / entry_price * 100
+    net_pct = gross_pct - (2 * cfg.commission_bps / 100)
+    risk_per_share = max(entry_price - initial_stop, 1e-9)
+    r_multiple = (entry_price * net_pct / 100) / risk_per_share
 
-    # יציאה כי עברה שנה שלמה (Max Hold)
-    return {"Exit_Date": future.index[-1], "Exit_Price": float(future.iloc[-1].Close), "Exit_Reason": "MaxHold", "Hold": len(future)}
+    return {
+        "Exit_Date": final_exit_date,
+        "Exit_Price": final_exit_price,
+        "Exit_Reason": exit_reason,
+        "Pct_Change": round(net_pct, 2),
+        "MFE_Pct": round(mfe_pct, 2),
+        "MAE_Pct": round(mae_pct, 2),
+        "R_Multiple": round(r_multiple, 2),
+        "Hold_Bars": len(future[future.index <= final_exit_date]),
+    }
 
 # ==========================================
-# 6. Candidate generation
+# 6. Candidate Generation
 # ==========================================
-def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, universe_df=None):
+def generate_candidates(tickers, data_cache, spy_df, cfg):
     candidates = []
     print("\nScanning for Ascending Triangle signals...")
 
@@ -381,7 +338,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
 
             test_days = df[(df.index >= test_start) & (df.index <= test_end)].index
             for current_date in test_days:
-                if cfg.use_point_in_time_universe and not ticker_allowed_on_date(ticker, current_date, universe_df): continue
+                if cfg.use_point_in_time_universe and not ticker_allowed_on_date(ticker, current_date, universe_df=None): continue
                 if not market_filter_ok(spy_df, current_date): continue
 
                 past_data = df[df.index <= current_date]
@@ -393,7 +350,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                 if len(pattern_data) < 250: continue
                 if not stock_filter_ok(today, cfg): continue
                 
-                # --- מסנן העוצמה היחסית (Relative Strength) ---
+                # בדיקת עוצמה יחסית מול השוק
                 spy_past = spy_df[spy_df.index <= current_date]
                 if not spy_past.empty:
                     spy_rs = float(spy_past.iloc[-1]["ROC_65"])
@@ -440,9 +397,9 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                 atr = float(today["ATR_14"])
                 if np.isnan(atr) or atr <= 0: continue
 
-                # --- סטופ לוס דינמי מבוסס ATR ---
+                # --- סטופ לוס הדוק עם מרווח ATR ---
                 tight_low = float(pattern["tight_low"])
-                calculated_stop = tight_low - (0.5 * atr) # תוספת חצי נר של מרווח נשימה
+                calculated_stop = tight_low - (0.5 * atr) 
                 max_allowed_stop = entry_price * (1 - cfg.max_risk_pct)
                 initial_stop = max(calculated_stop, max_allowed_stop)
                 
@@ -455,28 +412,27 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                 total_score = compute_signal_score(pattern["score"], stock_rs, vol_ratio, dist_52w, close_strength)
 
                 candidates.append({
-                    "Year": year, "Ticker": ticker, "Sector": get_sector_for_ticker(ticker, current_date, universe_df),
+                    "Year": year, "Ticker": ticker, "Sector": get_sector_for_ticker(ticker, current_date, universe_df=None),
                     "Signal_Date": current_date, "Entry_Date": entry_date, "Entry_Price": round(entry_price, 2),
-                    "Exit_Date": sim["Exit_Date"], "Exit_Price": round(sim["Exit_Price"], 2), "Pct_Change": sim["Exit_Price"]/entry_price-1,
+                    "Exit_Date": sim["Exit_Date"], "Exit_Price": round(sim["Exit_Price"], 2), "Pct_Change": sim["Pct_Change"],
                     "Risk_Pct": round(risk_pct * 100, 2), "Stop_Price": round(initial_stop, 2),
                     "Cup_Depth_Pct": round(pattern["cup_depth_pct"] * 100, 2), "Handle_Depth_Pct": round(pattern["handle_depth_pct"] * 100, 2),
                     "Cup_Length": int(pattern["cup_length"]), "Handle_Length": int(pattern["handle_length"]),
                     "Prior_Uptrend_Pct": round(pattern["prior_uptrend"] * 100, 2), "Handle_Tightness": pattern["tightness"],
-                    "Volume_Ratio": round(vol_ratio, 2), "Dist_52W_High": round(dist_52w, 4),
+                    "Volume_Ratio": round(vol_ratio, 2), "RS_65": round(stock_rs, 4), "Dist_52W_High": round(dist_52w, 4),
                     "Close_Strength": round(close_strength, 4), "Gap_From_Pivot": round(gap_from_pivot, 4),
-                    "Hold_Bars": sim["Hold_Bars"], "Result": classify_pnl(sim["Exit_Price"]/entry_price-1),
-                    "Exit_Reason": sim["Exit_Reason"], "Signal_Score": total_score,
+                    "Hold_Bars": sim["Hold_Bars"], "Result": classify_pnl(sim["Pct_Change"]),
+                    "Exit_Reason": sim["Exit_Reason"], "MFE_Pct": sim["MFE_Pct"], "MAE_Pct": sim["MAE_Pct"],
+                    "R_Multiple": sim["R_Multiple"], "Pattern_Score": pattern["score"], "Signal_Score": total_score,
                 })
 
     if not candidates: return pd.DataFrame()
-    
-    # מיון כדי לוודא שניקח את העסקאות הטובות ביותר קודם במידה ויש חפיפה בפורטפוליו
     return (pd.DataFrame(candidates)
-            .sort_values(["Entry_Date", "Signal_Score", "Volume_Ratio"], ascending=[True, False, False])
+            .sort_values(["Entry_Date", "Signal_Score", "Volume_Ratio", "RS_65"], ascending=[True, False, False, False])
             .reset_index(drop=True))
 
 # ==========================================
-# 7. Portfolio acceptance
+# 7. Portfolio Management (Real Money Simulation)
 # ==========================================
 def get_close_on_or_before(df: pd.DataFrame, dt: pd.Timestamp, fallback: float) -> float:
     x = df[df.index <= dt]
@@ -497,7 +453,6 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
     for cand in cand_records:
         entry_date = pd.Timestamp(cand["Entry_Date"])
         ticker = str(cand["Ticker"])
-        sector = str(cand.get("Sector", "UNKNOWN"))
 
         if ticker in last_exit_by_ticker and entry_date <= last_exit_by_ticker[ticker] + pd.Timedelta(days=cfg.cooldown_days):
             continue
@@ -515,9 +470,9 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
             cash += pos["Shares"] * pos["Exit_Price"] - pos["Exit_Fee"]
         active = still_active
 
+        # >>> אכיפה פיזית וקשוחה של עד 10 פוזיציות מקבילות בלבד <<<
         if any(pos["Ticker"] == ticker for pos in active): continue
         if len(active) >= cfg.max_positions: continue
-        if sector != "UNKNOWN" and sum(1 for pos in active if pos.get("Sector") == sector) >= 2: continue
 
         equity = cash + sum(
             get_close_on_or_before(data_cache[p["Ticker"]], entry_date, p["Entry_Price"]) * p["Shares"]
@@ -564,20 +519,16 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
         accepted.append(t)
         last_exit_by_ticker[ticker] = pd.Timestamp(t["Exit_Date"])
         active.append({
-            "Ticker": ticker, "Sector": sector, "Entry_Date": t["Entry_Date"], "Exit_Date": t["Exit_Date"],
+            "Ticker": ticker, "Entry_Date": t["Entry_Date"], "Exit_Date": t["Exit_Date"],
             "Entry_Price": entry_price, "Exit_Price": exit_price, "Shares": shares, "Exit_Fee": exit_fee,
             "Risk_Dollars": risk_dollars,
         })
 
     if not accepted: return pd.DataFrame()
-    
-    # הוספת חישוב Pct_Change אמיתי עבור הדוחות
-    accepted_df = pd.DataFrame(accepted).sort_values(["Entry_Date", "Exit_Date", "Ticker"]).reset_index(drop=True)
-    accepted_df["Pct_Change"] = accepted_df["Pct_Change"] * 100
-    return accepted_df
+    return pd.DataFrame(accepted).sort_values(["Entry_Date", "Exit_Date", "Ticker"]).reset_index(drop=True)
 
 # ==========================================
-# 8. Daily equity curve
+# 8. Daily Equity Curve
 # ==========================================
 def build_daily_equity_curve(accepted_df: pd.DataFrame, data_cache: dict, benchmark_df: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
     if accepted_df.empty:
@@ -639,7 +590,7 @@ def build_daily_equity_curve(accepted_df: pd.DataFrame, data_cache: dict, benchm
     return pd.DataFrame(rows)
 
 # ==========================================
-# 9. Summaries
+# 9. Summaries (Full Version)
 # ==========================================
 def calc_drawdown(equity_curve: pd.Series) -> float:
     if len(equity_curve) == 0: return 0.0
@@ -648,15 +599,14 @@ def calc_drawdown(equity_curve: pd.Series) -> float:
 
 def summarize_trades(trades_df: pd.DataFrame, equity_df: pd.DataFrame | None = None) -> dict:
     empty = {
-        "Trades": 0, "Wins": 0, "Losses": 0, "Flats": 0, "TimeExits": 0,
-        "Win_Rate_Pct": 0.0, "Avg_Trade_Pct": 0.0, "Avg_Win_Pct": 0.0, "Avg_Loss_Pct": 0.0,
-        "Total_Return_Pct": 0.0, "Max_Drawdown_Pct": 0.0, "Net_PnL": 0.0,
+        "Trades": 0, "Wins": 0, "Losses": 0, "Win_Rate_Pct": 0.0, 
+        "Avg_Trade_Pct": 0.0, "Avg_Win_Pct": 0.0, "Avg_Loss_Pct": 0.0,
+        "Total_Return_Pct": 0.0, "Max_Drawdown_Pct": 0.0, "Net_PnL": 0.0
     }
     if trades_df.empty: return empty
 
     wins = trades_df[trades_df["Pct_Change"] > 0]
     losses = trades_df[trades_df["Pct_Change"] < 0]
-    flats = trades_df[trades_df["Pct_Change"] == 0]
 
     total_return, max_dd = 0.0, 0.0
     if equity_df is not None and not equity_df.empty:
@@ -664,12 +614,11 @@ def summarize_trades(trades_df: pd.DataFrame, equity_df: pd.DataFrame | None = N
         max_dd = calc_drawdown(equity_df["Equity"])
 
     return {
-        "Trades": len(trades_df), "Wins": len(wins), "Losses": len(losses), "Flats": len(flats),
-        "TimeExits": int((trades_df["Exit_Reason"] == "TimeExit").sum()),
-        "Win_Rate_Pct": round(len(wins) / len(trades_df) * 100, 2),
+        "Trades": len(trades_df), "Wins": len(wins), "Losses": len(losses),
+        "Win_Rate_Pct": round(len(wins) / len(trades_df) * 100, 2) if len(trades_df) > 0 else 0.0,
         "Avg_Trade_Pct": round(trades_df["Pct_Change"].mean(), 2),
-        "Avg_Win_Pct": round(wins["Pct_Change"].mean(), 2) if len(wins) else 0.0,
-        "Avg_Loss_Pct": round(losses["Pct_Change"].mean(), 2) if len(losses) else 0.0,
+        "Avg_Win_Pct": round(wins["Pct_Change"].mean(), 2) if len(wins) > 0 else 0.0,
+        "Avg_Loss_Pct": round(losses["Pct_Change"].mean(), 2) if len(losses) > 0 else 0.0,
         "Total_Return_Pct": total_return, "Max_Drawdown_Pct": max_dd,
         "Net_PnL": round(trades_df["Net_PnL"].sum(), 2) if "Net_PnL" in trades_df.columns else 0.0,
     }
@@ -678,8 +627,9 @@ def yearly_summary(accepted_df: pd.DataFrame, equity_df: pd.DataFrame) -> pd.Dat
     if accepted_df.empty: return pd.DataFrame()
     tmp = accepted_df.copy()
     tmp["Entry_Date"] = pd.to_datetime(tmp["Entry_Date"])
+    tmp["Year"] = tmp["Entry_Date"].dt.year
     rows = []
-    for year, g in tmp.groupby(tmp["Entry_Date"].dt.year):
+    for year, g in tmp.groupby("Year"):
         eq = equity_df[equity_df["Date"].dt.year == year] if not equity_df.empty else pd.DataFrame()
         s = summarize_trades(g, eq)
         s["Year"] = year
@@ -695,7 +645,7 @@ def monthly_summary(accepted_df: pd.DataFrame) -> pd.DataFrame:
         tmp.groupby("Month")
         .agg(
             Trades=("Ticker", "count"),
-            Win_Rate_Pct=("Pct_Change", lambda s: round(s.gt(0).sum() / len(s) * 100, 2)),
+            Win_Rate_Pct=("Pct_Change", lambda s: round(s.gt(0).sum() / len(s) * 100, 2) if len(s) > 0 else 0),
             Avg_Trade_Pct=("Pct_Change", lambda s: round(s.mean(), 2)),
             Net_PnL=("Net_PnL", "sum"),
         )
@@ -705,38 +655,26 @@ def monthly_summary(accepted_df: pd.DataFrame) -> pd.DataFrame:
 # ==========================================
 # 10. Orchestrator
 # ==========================================
-def run_canslim_backtest_v7(tickers: list[str], cfg: BacktestConfig):
-    tickers = sorted({t.upper() for t in tickers})
-    universe_df = load_universe_membership(cfg.universe_file)
-    start_fetch = f"{cfg.start_year - 1}-01-01"
-    end_fetch = f"{cfg.end_year + 1}-02-01"
-
-    print(f"\nSNIPER VCP Backtest: {cfg.start_year}-{cfg.end_year}")
-    print("-" * 80)
-
-    spy = get_data(cfg.benchmark, start_fetch, end_fetch, cfg)
-    if spy.empty or len(spy) < 220: raise ValueError("Could not load benchmark data")
+def run_backtest_engine(tickers, cfg):
+    spy = get_data(cfg.benchmark, "2014-01-01", "2026-03-01", cfg)
     data_cache = {cfg.benchmark: spy}
-
-    print(f"Downloading/Loading {len(tickers)} tickers...")
-    for ticker in tqdm(tickers, desc="Tickers"):
-        data_cache[ticker] = get_data(ticker, start_fetch, end_fetch, cfg)
-
-    candidates_df = generate_candidate_trades(tickers, data_cache, spy, cfg, universe_df=universe_df)
-    accepted_df = accept_trades_with_portfolio_rules(candidates_df, data_cache, cfg)
-
-    if not accepted_df.empty:
-        accepted_df = accepted_df.sort_values(["Entry_Date", "Exit_Date", "Ticker"]).reset_index(drop=True)
-
-    equity_df = build_daily_equity_curve(accepted_df, data_cache, spy, cfg)
-    yearly_df = yearly_summary(accepted_df, equity_df)
-    monthly_df = monthly_summary(accepted_df)
-    overall = summarize_trades(accepted_df, equity_df)
-
-    return candidates_df, accepted_df, equity_df, yearly_df, monthly_df, overall
+    
+    # >>> סריקה מלאה של כל הטיקרים שהתקבלו (S&P 500 המלא) <<<
+    for t in tqdm(tickers, desc="Loading Data"):
+        data_cache[t] = get_data(t, "2014-01-01", "2026-03-01", cfg)
+        
+    cands = generate_candidates(tickers, data_cache, spy, cfg)
+    acc = accept_trades_with_portfolio_rules(cands, data_cache, cfg)
+    eq = build_daily_equity_curve(acc, data_cache, spy, cfg)
+    
+    yearly_df = yearly_summary(acc, eq)
+    monthly_df = monthly_summary(acc)
+    overall = summarize_trades(acc, eq)
+    
+    return cands, acc, eq, yearly_df, monthly_df, overall
 
 # ==========================================
-# 11. Output helpers
+# 11. Output Helpers
 # ==========================================
 def save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, overall, cfg: BacktestConfig):
     out_dir = Path("output") / cfg.output_prefix
@@ -751,9 +689,12 @@ def save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, o
     pd.DataFrame([asdict(cfg)]).to_csv(out_dir / "config.csv", index=False, encoding="utf-8-sig")
     print(f"\nFiles saved -> {out_dir}/")
 
-def print_report(overall: dict, yearly_df: pd.DataFrame):
+def print_final_report(overall: dict, yearly_df: pd.DataFrame):
+    if not overall or overall.get('Trades', 0) == 0:
+        print("No trades executed.")
+        return
     print("\n" + "=" * 80)
-    print("ASCENDING TRIANGLE VCP (SNIPER) - Backtest Report")
+    print("ASCENDING TRIANGLE BACKTEST REPORT (v15 - Strict Portfolio)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
@@ -767,28 +708,28 @@ def print_report(overall: dict, yearly_df: pd.DataFrame):
     print("=" * 80)
 
 # ==========================================
-# 12. Utilities
+# 12. Utilities (Wikipedia Fix)
 # ==========================================
-def fetch_sp500_tickers_current() -> list[str]:
+def fetch_sp500():
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=20) as response:
             tables = pd.read_html(response.read())
-        tickers = tables[0]["Symbol"].astype(str).str.upper().str.replace(".", "-", regex=False).tolist()
-        return sorted(tickers)
-    except Exception:
-        return ["AAPL", "MSFT", "NVDA", "AMZN", "META"]
+        return tables[0]["Symbol"].str.replace('.', '-', regex=False).tolist()
+    except:
+        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "TSLA"]
 
 # ==========================================
 # 13. Main
 # ==========================================
 if __name__ == "__main__":
     cfg = BacktestConfig()
-
-    tickers = fetch_sp500_tickers_current() if not cfg.use_point_in_time_universe else sorted(pd.read_csv(cfg.universe_file)["Ticker"].astype(str).str.upper().unique())
-
-    candidates_df, accepted_df, equity_df, yearly_df, monthly_df, overall = run_canslim_backtest_v7(tickers, cfg)
-
-    print_report(overall, yearly_df)
-    save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, overall, cfg)
+    tickers = fetch_sp500()
+    
+    # הפעלת המנוע
+    cands, acc, eq, yearly, monthly, overall = run_backtest_engine(tickers, cfg)
+    
+    # שמירה לכל 7 הקבצים בתיקייה
+    save_outputs(cands, acc, eq, yearly, monthly, overall, cfg)
+    print_final_report(overall, yearly)
