@@ -6,7 +6,6 @@ from pathlib import Path
 import warnings
 import time
 from tqdm import tqdm
-import urllib.request
 import os
 
 warnings.filterwarnings("ignore")
@@ -22,8 +21,10 @@ class BacktestConfig:
     initial_capital: float = 100_000.0
     risk_per_trade: float = 0.005      
     
+    # --- קובץ מניות אישי ---
     custom_tickers_file: str = "mystock.csv" 
     
+    # הגדרות התיק המנצחות
     max_alloc_pct: float = 0.12        
     max_positions: int = 10            
     max_portfolio_heat: float = 0.04   
@@ -31,31 +32,31 @@ class BacktestConfig:
     slippage_bps: float = 12
     commission_bps: float = 2
     
-    # מסנני שוק למניות צמיחה
-    breakout_volume_ratio: float = 1.15 
-    min_dollar_vol_50: float = 30_000_000 
+    # מסנני שוק ופריצה
+    breakout_volume_ratio: float = 1.1 
+    min_dollar_vol_50: float = 30_000_000 # נזילות יפה שמסננת מניפולציות
     min_price: float = 15.0               
     
-    # --- מערכת הסיכון החדשה למניות תנודתיות (V25) ---
-    min_risk_pct: float = 0.02         
-    max_risk_pct: float = 0.08         # הוגדל ל-8% כדי לא לפסול את הפריצות האגרסיביות ביותר
+    # --- מערכת ניהול הזמן והסיכון (V26) ---
+    min_risk_pct: float = 0.01         
+    max_risk_pct: float = 0.06         # מאפשר מרווח בטוח למניות תנודתיות
     max_hold_bars: int = 250           
-    time_stop_bars: int = 25           
-    min_profit_after_time_stop: float = 0.01 
+    time_stop_bars: int = 20           # חותכים מניות משעממות תוך 20 ימי מסחר!
+    min_profit_after_time_stop: float = 0.015 # חותכים אם אין לפחות 1.5% רווח
     
     # פרמטרים גיאומטריים (VCP)
     min_prior_uptrend: float = 0.08    
     max_base_depth: float = 0.35       
     max_tightness_depth: float = 0.08  
-    min_breakout_close_strength: float = 0.40
-    min_rs_65: float = 0.04            
+    min_breakout_close_strength: float = 0.35
+    min_rs_65: float = 0.04            # עוצמה יחסית חזקה למניות מנהיגות
     max_dist_from_52w_high: float = 0.15
     
     max_pivot_extension: float = 0.04  
     max_entry_extension: float = 0.03  
     max_gap_above_pivot: float = 0.02
     
-    early_exit_bars: int = 12          
+    early_exit_bars: int = 10          
     early_exit_min_progress: float = -0.02 
     min_tight_closes_in_handle: int = 0
     
@@ -63,7 +64,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v25_growth_stocks"
+    output_prefix: str = "canslim_v26_timestop_20"
 
 # ==========================================
 # 1. Data & Indicators
@@ -77,7 +78,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if getattr(df.index, "tz", None) is not None:
         df.index = df.index.tz_localize(None)
     df = df.sort_index()
-    
     df = df[~df.index.duplicated(keep='first')]
 
     df["SMA_21"] = df["Close"].rolling(21).mean()
@@ -100,7 +100,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         (df["Low"] - df["Prev_Close"]).abs(),
     ], axis=1).max(axis=1)
     df["ATR_14"] = tr.rolling(14).mean()
-    df["ATR_Pct"] = df["ATR_14"] / df["Close"]
+    # הגנה מחלוקה באפס
+    df["ATR_Pct"] = df["ATR_14"] / np.where(df["Close"] > 0, df["Close"], 1e-9)
 
     return df
 
@@ -108,10 +109,13 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v25.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v26.pkl"
 
     if cache_file.exists():
-        return pd.read_pickle(cache_file)
+        try:
+            return pd.read_pickle(cache_file)
+        except:
+            pass
 
     for _ in range(retries):
         try:
@@ -127,7 +131,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
                 return df
             return df
         except Exception:
-            time.sleep(1.5)
+            time.sleep(1.0)
 
     return pd.DataFrame()
 
@@ -177,7 +181,7 @@ def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     if float(today["DollarVol_50"]) < cfg.min_dollar_vol_50: return False
     if not (0.01 <= float(today["ATR_Pct"]) <= 0.08): return False
 
-    dist_52w = (float(today["Close"]) / float(today["High_252"])) - 1.0
+    dist_52w = (float(today["Close"]) / max(float(today["High_252"]), 1e-9)) - 1.0
     if dist_52w < -cfg.max_dist_from_52w_high: return False
 
     return True
@@ -206,7 +210,7 @@ def get_ascending_triangle_signal(pattern_data: pd.DataFrame, cfg: BacktestConfi
     valley1_price = float(post_peak1_lows[valley1_pos_rel])
     valley1_pos = peak1_pos + 1 + valley1_pos_rel
 
-    base_depth = (peak1_price - valley1_price) / peak1_price
+    base_depth = (peak1_price - valley1_price) / max(peak1_price, 1e-9)
     if base_depth > cfg.max_base_depth: return None
 
     post_valley1_highs = highs[valley1_pos+1 : -2]
@@ -227,7 +231,7 @@ def get_ascending_triangle_signal(pattern_data: pd.DataFrame, cfg: BacktestConfi
     if valley2_price <= valley1_price * 1.015: 
         return None
 
-    tightness = (peak2_price - valley2_price) / peak2_price
+    tightness = (peak2_price - valley2_price) / max(peak2_price, 1e-9)
     if tightness > cfg.max_tightness_depth: 
         return None
 
@@ -254,7 +258,7 @@ def compute_signal_score(pattern_score: float, rs_65: float, volume_ratio: float
     return round(pattern_score + rs_component + vol_component + near_high_component + cs_component, 4)
 
 # ==========================================
-# 5. Patient Trade Simulation (Growth Stock Logic)
+# 5. Patient Trade Simulation (Time Stop 20 & Trailing)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -268,6 +272,9 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
     stop_today = float(initial_stop)
     stop_next_day = float(initial_stop)
     
+    if stop_next_day >= entry_price:
+        stop_next_day = entry_price * 0.985 
+        
     highest_seen = float(entry_price)
     lowest_seen = float(entry_price)
 
@@ -280,67 +287,75 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 
         stop_today = initial_stop if i == 0 else stop_next_day
 
+        # פער (Gap) נגדנו מתחת לסטופ בפתיחת המסחר
         if day_open <= stop_today:
             final_exit_price = day_open * (1 - cfg.slippage_bps / 10000)
-            gross_pct = (final_exit_price - entry_price) / entry_price * 100
+            gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
             net_pct = gross_pct - (2 * cfg.commission_bps / 100)
             return {
                 "Exit_Date": dt, "Exit_Price": final_exit_price, "Exit_Reason": "GapStop", "Hold_Bars": i+1,
-                "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2),
-                "MAE_Pct": round((min(lowest_seen, day_open)/entry_price-1)*100, 2), "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)
+                "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
+                "MAE_Pct": round((min(lowest_seen, day_open)/max(entry_price, 1e-9)-1)*100, 2), 
+                "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)
             }
 
+        # חיתוך הפסד (Stop Hit) במהלך היום
         if day_low <= stop_today:
             final_exit_price = stop_today * (1 - cfg.slippage_bps / 10000)
-            gross_pct = (final_exit_price - entry_price) / entry_price * 100
+            gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
             net_pct = gross_pct - (2 * cfg.commission_bps / 100)
             return {
                 "Exit_Date": dt, "Exit_Price": final_exit_price, "Exit_Reason": "StopHit", "Hold_Bars": i+1,
-                "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2),
-                "MAE_Pct": round((min(lowest_seen, day_low)/entry_price-1)*100, 2), "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)
+                "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
+                "MAE_Pct": round((min(lowest_seen, day_low)/max(entry_price, 1e-9)-1)*100, 2), 
+                "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)
             }
 
         highest_seen = max(highest_seen, day_high)
         lowest_seen = min(lowest_seen, day_low)
-        profit_high = (highest_seen - entry_price) / entry_price
+        profit_high = (highest_seen - entry_price) / max(entry_price, 1e-9)
         
-        # --- ניהול פוזיציה שמותאם למניות קופצניות ---
+        # --- הגנות מנצחים והעלאת סטופ אוטומטית ---
         new_stop = stop_today
-        # נותנים למניה לעלות 12% לפני שחונקים אותה לברייק איוון
-        if profit_high >= 0.12: new_stop = max(new_stop, entry_price * 1.01) 
-        # טריילינג רחב שנותן מקום לתיקונים טבעיים של מניות צמיחה (15% מרווח)
-        if profit_high >= 0.20: new_stop = max(new_stop, highest_seen * 0.85) 
-        if profit_high >= 0.40: new_stop = max(new_stop, highest_seen * 0.80) 
+        if profit_high >= 0.08: new_stop = max(new_stop, entry_price * 1.005) # ברייק-איוון מהיר
+        if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.90) # טריילינג סטופ 10%
+        if profit_high >= 0.30: new_stop = max(new_stop, highest_seen * 0.85) # טריילינג סטופ 15%
 
         stop_next_day = max(stop_today, new_stop)
 
+        # יציאה מוקדמת למניות חלשות
         if (i + 1) == cfg.early_exit_bars:
-            if (day_close / entry_price) - 1.0 < cfg.early_exit_min_progress:
+            if (day_close / max(entry_price, 1e-9)) - 1.0 < cfg.early_exit_min_progress:
                 final_exit_price = day_close * (1 - cfg.slippage_bps / 10000)
-                gross_pct = (final_exit_price - entry_price) / entry_price * 100
+                gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
                 return {
                     "Exit_Date": dt, "Exit_Price": final_exit_price, "Exit_Reason": "EarlyFail", "Hold_Bars": i+1,
-                    "Pct_Change": round(gross_pct - (2 * cfg.commission_bps / 100), 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2),
-                    "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": 0.0
+                    "Pct_Change": round(gross_pct - (2 * cfg.commission_bps / 100), 2), 
+                    "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
+                    "MAE_Pct": round((lowest_seen/max(entry_price, 1e-9)-1)*100, 2), "R_Multiple": 0.0
                 }
 
+        # --- יציאת זמן (Time Stop) אגרסיבית אחרי 20 יום ---
         if (i + 1) >= cfg.time_stop_bars:
-            if (day_close - entry_price) / entry_price < cfg.min_profit_after_time_stop:
+            if (day_close - entry_price) / max(entry_price, 1e-9) < cfg.min_profit_after_time_stop:
                 final_exit_price = day_close * (1 - cfg.slippage_bps / 10000)
-                gross_pct = (final_exit_price - entry_price) / entry_price * 100
+                gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
                 return {
                     "Exit_Date": dt, "Exit_Price": final_exit_price, "Exit_Reason": "TimeExit", "Hold_Bars": i+1,
-                    "Pct_Change": round(gross_pct - (2 * cfg.commission_bps / 100), 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2),
-                    "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": 0.0
+                    "Pct_Change": round(gross_pct - (2 * cfg.commission_bps / 100), 2), 
+                    "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
+                    "MAE_Pct": round((lowest_seen/max(entry_price, 1e-9)-1)*100, 2), "R_Multiple": 0.0
                 }
 
+    # יציאה סופית למנצחות ארוכות טווח
     final_exit_price = float(future.iloc[-1]["Close"]) * (1 - cfg.slippage_bps / 10000)
-    gross_pct = (final_exit_price - entry_price) / entry_price * 100
+    gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
     net_pct = gross_pct - (2 * cfg.commission_bps / 100)
     return {
         "Exit_Date": future.index[-1], "Exit_Price": final_exit_price, "Exit_Reason": "MaxHold", "Hold_Bars": len(future),
-        "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/entry_price-1)*100, 2),
-        "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)
+        "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
+        "MAE_Pct": round((lowest_seen/max(entry_price, 1e-9)-1)*100, 2), 
+        "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)
     }
 
 # ==========================================
@@ -348,106 +363,106 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, universe_df=None):
     candidates = []
-    print(f"\nScanning for Ascending Triangle signals in {len(tickers)} stocks...")
+    print(f"\nScanning for signals in {len(tickers)} stocks with strict 20-Day Time Stop...")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
         test_end = pd.Timestamp(f"{year}-12-31")
 
         for ticker in tickers:
-            df = data_cache.get(ticker, pd.DataFrame())
-            if df.empty or len(df) < 260: continue
+            try:
+                df = data_cache.get(ticker, pd.DataFrame())
+                if df.empty or len(df) < 260: continue
 
-            test_days = df[(df.index >= test_start) & (df.index <= test_end)].index
-            for current_date in test_days:
-                if cfg.use_point_in_time_universe and not ticker_allowed_on_date(ticker, current_date, universe_df): continue
-                if not market_filter_ok(spy_df, current_date): continue
+                test_days = df[(df.index >= test_start) & (df.index <= test_end)].index
+                for current_date in test_days:
+                    if cfg.use_point_in_time_universe and not ticker_allowed_on_date(ticker, current_date, universe_df): continue
+                    if not market_filter_ok(spy_df, current_date): continue
 
-                past_data = df[df.index <= current_date]
-                if len(past_data) < 251: continue
+                    past_data = df[df.index <= current_date]
+                    if len(past_data) < 251: continue
 
-                pattern_data = past_data.iloc[:-1].copy()
-                today = past_data.iloc[-1]
+                    pattern_data = past_data.iloc[:-1].copy()
+                    today = past_data.iloc[-1]
 
-                if len(pattern_data) < 250: continue
-                if not stock_filter_ok(today, cfg): continue
-                
-                spy_past = spy_df[spy_df.index <= current_date]
-                if not spy_past.empty:
-                    spy_rs = float(spy_past.iloc[-1]["ROC_65"])
-                    stock_rs = float(today["ROC_65"])
-                    if (stock_rs - spy_rs) < cfg.min_rs_65:
+                    if len(pattern_data) < 250: continue
+                    if not stock_filter_ok(today, cfg): continue
+                    
+                    spy_past = spy_df[spy_df.index <= current_date]
+                    if not spy_past.empty:
+                        spy_rs = float(spy_past.iloc[-1]["ROC_65"])
+                        stock_rs = float(today["ROC_65"])
+                        if (stock_rs - spy_rs) < cfg.min_rs_65:
+                            continue
+
+                    pattern = get_ascending_triangle_signal(pattern_data, cfg)
+                    if pattern is None: continue
+
+                    pivot = pattern["pivot_price"]
+                    prev_close = float(pattern_data.iloc[-1]["Close"])
+                    close = float(today["Close"])
+                    high_today = float(today["High"])
+                    low_today = float(today["Low"])
+
+                    day_range = max(high_today - low_today, 1e-9)
+                    close_strength = (close - low_today) / day_range
+                    if close_strength < cfg.min_breakout_close_strength: continue
+
+                    vol_ratio = float(today["Volume"]) / max(float(today["Vol_50"]), 1e-9)
+                    if pd.isna(vol_ratio) or vol_ratio < cfg.breakout_volume_ratio: continue
+
+                    if not (prev_close <= pivot and high_today > pivot and close > pivot and close <= pivot * (1 + cfg.max_pivot_extension)):
                         continue
 
-                pattern = get_ascending_triangle_signal(pattern_data, cfg)
-                if pattern is None: continue
+                    high_252 = float(today["High_252"])
+                    if high_252 <= 0 or pd.isna(high_252): continue
+                    dist_52w = (close / high_252) - 1.0
+                    if dist_52w < -cfg.max_dist_from_52w_high: continue
 
-                pivot = pattern["pivot_price"]
-                prev_close = float(pattern_data.iloc[-1]["Close"])
-                close = float(today["Close"])
-                high_today = float(today["High"])
-                low_today = float(today["Low"])
+                    next_bar = df[df.index > current_date].head(1)
+                    if next_bar.empty: continue
 
-                day_range = max(high_today - low_today, 1e-9)
-                close_strength = (close - low_today) / day_range
-                if close_strength < cfg.min_breakout_close_strength: continue
+                    entry_date = next_bar.index[0]
+                    entry_open = float(next_bar.iloc[0]["Open"])
 
-                vol_ratio = float(today["Volume"]) / float(today["Vol_50"]) if today["Vol_50"] > 0 else np.nan
-                if pd.isna(vol_ratio) or vol_ratio < cfg.breakout_volume_ratio: continue
+                    gap_from_pivot = (entry_open / max(pivot, 1e-9)) - 1.0
+                    if gap_from_pivot > cfg.max_gap_above_pivot: continue
 
-                if not (prev_close <= pivot and high_today > pivot and close > pivot and close <= pivot * (1 + cfg.max_pivot_extension)):
-                    continue
+                    entry_price = entry_open * (1 + cfg.slippage_bps / 10000)
+                    if entry_price > pivot * (1 + cfg.max_entry_extension): continue
 
-                high_252 = float(today["High_252"])
-                if high_252 <= 0 or pd.isna(high_252): continue
-                dist_52w = (close / high_252) - 1.0
-                if dist_52w < -cfg.max_dist_from_52w_high: continue
+                    atr = float(today["ATR_14"])
+                    if np.isnan(atr) or atr <= 0: continue
 
-                next_bar = df[df.index > current_date].head(1)
-                if next_bar.empty: continue
+                    tight_low = float(pattern["tight_low"])
+                    calculated_stop = tight_low - (0.5 * atr) 
+                    max_allowed_stop = entry_price * (1 - cfg.max_risk_pct)
+                    initial_stop = max(calculated_stop, max_allowed_stop)
+                    
+                    risk_pct = (entry_price - initial_stop) / max(entry_price, 1e-9)
+                    if not (cfg.min_risk_pct <= risk_pct <= cfg.max_risk_pct): continue
 
-                entry_date = next_bar.index[0]
-                entry_open = float(next_bar.iloc[0]["Open"])
+                    sim = simulate_trade(df, entry_date, entry_price, initial_stop, cfg)
+                    if sim is None: continue
 
-                gap_from_pivot = (entry_open / pivot) - 1.0
-                if gap_from_pivot > cfg.max_gap_above_pivot: continue
+                    total_score = compute_signal_score(pattern["score"], stock_rs, vol_ratio, dist_52w, close_strength)
 
-                entry_price = entry_open * (1 + cfg.slippage_bps / 10000)
-                if entry_price > pivot * (1 + cfg.max_entry_extension): continue
-
-                atr = float(today["ATR_14"])
-                if np.isnan(atr) or atr <= 0: continue
-
-                # --- סטופ לוס עם מרווח נשימה מלא של ATR ---
-                tight_low = float(pattern["tight_low"])
-                calculated_stop = tight_low - atr 
-                max_allowed_stop = entry_price * (1 - cfg.max_risk_pct)
-                
-                # בוחרים את הגבוה מביניהם כדי לא לחרוג מ-8% הפסד
-                initial_stop = max(calculated_stop, max_allowed_stop)
-                
-                risk_pct = (entry_price - initial_stop) / entry_price
-                if not (cfg.min_risk_pct <= risk_pct <= cfg.max_risk_pct): continue
-
-                sim = simulate_trade(df, entry_date, entry_price, initial_stop, cfg)
-                if sim is None: continue
-
-                total_score = compute_signal_score(pattern["score"], stock_rs, vol_ratio, dist_52w, close_strength)
-
-                candidates.append({
-                    "Year": year, "Ticker": ticker, "Sector": get_sector_for_ticker(ticker, current_date, universe_df),
-                    "Signal_Date": current_date, "Entry_Date": entry_date, "Entry_Price": round(entry_price, 2),
-                    "Exit_Date": sim["Exit_Date"], "Exit_Price": round(sim["Exit_Price"], 2), "Pct_Change": sim["Pct_Change"],
-                    "Risk_Pct": round(risk_pct * 100, 2), "Stop_Price": round(initial_stop, 2),
-                    "Cup_Depth_Pct": round(pattern["cup_depth_pct"] * 100, 2), "Handle_Depth_Pct": round(pattern["handle_depth_pct"] * 100, 2),
-                    "Cup_Length": int(pattern["cup_length"]), "Handle_Length": int(pattern["handle_length"]),
-                    "Prior_Uptrend_Pct": round(pattern["prior_uptrend"] * 100, 2), "Handle_Tightness": pattern["tightness"],
-                    "Volume_Ratio": round(vol_ratio, 2), "RS_65": round(stock_rs, 4), "Dist_52W_High": round(dist_52w, 4),
-                    "Close_Strength": round(close_strength, 4), "Gap_From_Pivot": round(gap_from_pivot, 4),
-                    "Hold_Bars": sim["Hold_Bars"], "Result": classify_pnl(sim["Pct_Change"]),
-                    "Exit_Reason": sim["Exit_Reason"], "MFE_Pct": sim["MFE_Pct"], "MAE_Pct": sim["MAE_Pct"],
-                    "R_Multiple": sim["R_Multiple"], "Signal_Score": total_score,
-                })
+                    candidates.append({
+                        "Year": year, "Ticker": ticker, "Sector": get_sector_for_ticker(ticker, current_date, universe_df),
+                        "Signal_Date": current_date, "Entry_Date": entry_date, "Entry_Price": round(entry_price, 2),
+                        "Exit_Date": sim["Exit_Date"], "Exit_Price": round(sim["Exit_Price"], 2), "Pct_Change": sim["Pct_Change"],
+                        "Risk_Pct": round(risk_pct * 100, 2), "Stop_Price": round(initial_stop, 2),
+                        "Cup_Depth_Pct": round(pattern["cup_depth_pct"] * 100, 2), "Handle_Depth_Pct": round(pattern["handle_depth_pct"] * 100, 2),
+                        "Cup_Length": int(pattern["cup_length"]), "Handle_Length": int(pattern["handle_length"]),
+                        "Prior_Uptrend_Pct": round(pattern["prior_uptrend"] * 100, 2), "Handle_Tightness": pattern["tightness"],
+                        "Volume_Ratio": round(vol_ratio, 2), "RS_65": round(stock_rs, 4), "Dist_52W_High": round(dist_52w, 4),
+                        "Close_Strength": round(close_strength, 4), "Gap_From_Pivot": round(gap_from_pivot, 4),
+                        "Hold_Bars": sim["Hold_Bars"], "Result": classify_pnl(sim["Pct_Change"]),
+                        "Exit_Reason": sim["Exit_Reason"], "MFE_Pct": sim["MFE_Pct"], "MAE_Pct": sim["MAE_Pct"],
+                        "R_Multiple": sim["R_Multiple"], "Signal_Score": total_score,
+                    })
+            except Exception as e:
+                pass
 
     if not candidates: return pd.DataFrame()
     return (pd.DataFrame(candidates)
@@ -514,8 +529,8 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
         if remaining_heat <= 0: continue
 
         shares_by_risk = min(max_risk_dollars_trade, remaining_heat) / risk_per_share
-        shares_by_alloc = (equity * cfg.max_alloc_pct) / entry_price
-        shares_by_cash = cash / (entry_price * (1 + cfg.commission_bps / 10000))
+        shares_by_alloc = (equity * cfg.max_alloc_pct) / max(entry_price, 1e-9)
+        shares_by_cash = cash / (max(entry_price, 1e-9) * (1 + cfg.commission_bps / 10000))
 
         shares = int(np.floor(min(shares_by_risk, shares_by_alloc, shares_by_cash)))
         if shares < 1: continue
@@ -535,7 +550,7 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
         t["Gross_Entry"] = round(shares * entry_price, 2)
         t["Gross_Exit"] = round(shares * exit_price, 2)
         t["Net_PnL"] = round((shares * (exit_price - entry_price)) - entry_fee - exit_fee, 2)
-        t["Alloc_Pct"] = round(shares * entry_price / equity * 100, 2) if equity > 0 else 0.0
+        t["Alloc_Pct"] = round(shares * entry_price / max(equity, 1e-9) * 100, 2) if equity > 0 else 0.0
         t["Risk_Dollars"] = round(risk_dollars, 2)
         
         accepted.append(t)
@@ -612,7 +627,7 @@ def build_daily_equity_curve(accepted_df: pd.DataFrame, data_cache: dict, benchm
     return pd.DataFrame(rows)
 
 # ==========================================
-# 9. Summaries 
+# 9. Summaries
 # ==========================================
 def calc_drawdown(equity_curve: pd.Series) -> float:
     if len(equity_curve) == 0: return 0.0
@@ -632,7 +647,7 @@ def summarize_trades(trades_df: pd.DataFrame, equity_df: pd.DataFrame | None = N
 
     total_return, max_dd = 0.0, 0.0
     if equity_df is not None and not equity_df.empty:
-        total_return = round((equity_df["Equity"].iloc[-1] / equity_df["Equity"].iloc[0] - 1.0) * 100, 2)
+        total_return = round((equity_df["Equity"].iloc[-1] / max(equity_df["Equity"].iloc[0], 1e-9) - 1.0) * 100, 2)
         max_dd = calc_drawdown(equity_df["Equity"])
 
     return {
@@ -715,7 +730,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("GROWTH STOCKS VCP BACKTEST REPORT (v25 - Broad Market Unlocked)")
+    print("VCP BACKTEST REPORT (v26 - 20-Day Time Stop & Strict Risk)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
