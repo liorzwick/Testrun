@@ -20,9 +20,9 @@ class BacktestConfig:
     benchmark: str = "SPY"
     initial_capital: float = 100_000.0
     risk_per_trade: float = 0.005      
-    max_alloc_pct: float = 0.12        
-    max_positions: int = 10            
-    max_portfolio_heat: float = 0.04   
+    max_alloc_pct: float = 0.12        # עד 12% מהתיק למניה
+    max_positions: int = 10            # <<< מקסימום 10 פוזיציות פתוחות (אכיפה קשיחה)
+    max_portfolio_heat: float = 0.04   # מקסימום סיכון של 4% על כל התיק יחד
     cooldown_days: int = 15
     slippage_bps: float = 12
     commission_bps: float = 2
@@ -31,9 +31,9 @@ class BacktestConfig:
     min_dollar_vol_50: float = 25_000_000
     min_price: float = 15.0
     
-    # ניהול טרייד - נותנים קצת יותר אוויר 
+    # ניהול טרייד והגבלת סטופ
     min_risk_pct: float = 0.01         
-    max_risk_pct: float = 0.06         # הגדלנו ל-6% כדי לתת למרווח ה-ATR לנשום
+    max_risk_pct: float = 0.06         
     max_hold_bars: int = 250           
     time_stop_bars: int = 35           
     min_profit_after_time_stop: float = 0.01 
@@ -43,7 +43,7 @@ class BacktestConfig:
     max_base_depth: float = 0.35       
     max_tightness_depth: float = 0.08  
     min_breakout_close_strength: float = 0.30
-    min_rs_65: float = 0.00            # החזרנו ל-0 כדי לא לרדוף אחרי מניות מתוחות מדי
+    min_rs_65: float = 0.02            # העדפה למניות חזקות מהמדד
     max_dist_from_52w_high: float = 0.15
     
     min_cup_depth: float = 0.04
@@ -65,14 +65,13 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "ascending_triangle_v12"
+    output_prefix: str = "v13_strict_portfolio"
 
 # ==========================================
 # 1. Data & Indicators
 # ==========================================
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
         
@@ -97,8 +96,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig) -> pd.DataFrame:
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
-    # שם קובץ חדש (v12) כדי למשוך נתונים טריים ונקיים
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_v12.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_v13.pkl"
     if cache_file.exists(): return pd.read_pickle(cache_file)
     try:
         df = yf.download(ticker, start=start_fetch, end=end_fetch, auto_adjust=True, progress=False)
@@ -108,12 +106,6 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig)
             return df
     except: pass
     return pd.DataFrame()
-
-# ==========================================
-# 2. Universe Handling
-# ==========================================
-def load_universe_membership(path: str | None): return None
-def ticker_allowed_on_date(ticker, dt, universe_df): return True
 
 # ==========================================
 # 3. Filters
@@ -187,20 +179,16 @@ def get_ascending_triangle_signal(pattern_data: pd.DataFrame, cfg: BacktestConfi
 
     pivot = max(peak1_price, peak2_price)
 
-    return {
-        "pivot_price": pivot, 
-        "tight_low": valley2_price 
-    }
+    return {"pivot_price": pivot, "tight_low": valley2_price}
 
 # ==========================================
-# 5. Patient Trade Simulation (TIGHT STOP & LET WINNERS RUN)
+# 5. Patient Trade Simulation
 # ==========================================
 def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: float, initial_stop: float, cfg: BacktestConfig):
     future = df[df.index >= entry_date].head(cfg.max_hold_bars)
     if future.empty: return None
     
     stop_price = float(initial_stop)
-    
     if stop_price >= entry_price:
         stop_price = entry_price * 0.985 
         
@@ -214,7 +202,6 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         highest_seen = max(highest_seen, day_high)
         profit = (highest_seen / entry_price) - 1
 
-        # מחכים 8% רווח לפני שמזיזים לברייק-איוון כדי למנוע ניעורים
         if profit >= 0.08: stop_price = max(stop_price, entry_price * 1.005) 
         if profit >= 0.15: stop_price = max(stop_price, highest_seen * 0.90) 
         if profit >= 0.30: stop_price = max(stop_price, highest_seen * 0.85) 
@@ -236,7 +223,8 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidates(tickers, data_cache, spy_df, cfg):
     candidates = []
-    for ticker in tqdm(tickers, desc="Scanning Geometry"):
+    # סורק את כל הרשימה שהועברה לו
+    for ticker in tqdm(tickers, desc="Scanning S&P 500"):
         df = data_cache.get(ticker, pd.DataFrame())
         if df.empty or len(df) < 250: continue
         for i in range(250, len(df)):
@@ -264,11 +252,8 @@ def generate_candidates(tickers, data_cache, spy_df, cfg):
                         
                         entry_p = float(df.iloc[i+1].Open) * (1+cfg.slippage_bps/10000)
                         
-                        # --- החידוש: סטופ מבוסס ATR במקום גיאומטריה יבשה ---
                         atr_val = float(today["ATR_14"])
                         tight_low = float(pattern["tight_low"])
-                        
-                        # הסטופ יהיה השפל האחרון פחות חצי יום של תנודתיות (כדי להתחמק מעושי שוק)
                         calculated_stop = tight_low - (0.5 * atr_val)
                         max_allowed_stop = entry_p * (1 - cfg.max_risk_pct)
                         initial_stop = max(calculated_stop, max_allowed_stop)
@@ -279,88 +264,172 @@ def generate_candidates(tickers, data_cache, spy_df, cfg):
                             candidates.append({
                                 "Year": today.name.year, "Ticker": ticker, "Entry_Date": df.index[i+1], 
                                 "Exit_Date": sim["Exit_Date"], "Entry_Price": entry_p, "Exit_Price": sim["Exit_Price"], 
-                                "Pct": (sim["Exit_Price"]/entry_p-1)*100, "Reason": sim["Exit_Reason"]
+                                "Pct": (sim["Exit_Price"]/entry_p-1)*100, "Reason": sim["Exit_Reason"],
+                                "Stop_Price": initial_stop
                             })
     if not candidates: return pd.DataFrame()
     return pd.DataFrame(candidates).sort_values("Entry_Date").reset_index(drop=True)
 
 # ==========================================
-# 7. Portfolio Management (Real Money Simulation)
+# 7. Portfolio Management (STRICT RULES)
 # ==========================================
-def accept_trades(candidates, data_cache, cfg):
+def get_close_on_or_before(df: pd.DataFrame, dt: pd.Timestamp, fallback: float) -> float:
+    x = df[df.index <= dt]
+    return float(x.iloc[-1]["Close"]) if not x.empty else fallback
+
+def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dict, cfg: BacktestConfig) -> pd.DataFrame:
     if candidates.empty: return pd.DataFrame()
-    cash, active, accepted = cfg.initial_capital, [], []
-    
-    for cand in candidates.to_dict("records"):
-        dt = pd.Timestamp(cand["Entry_Date"])
-        
-        for p in active[:]:
-            if pd.Timestamp(p["Exit_Date"]) < dt:
-                cash += p["Shares"] * p["Exit_Price"] * (1 - cfg.commission_bps/10000)
-                active.remove(p)
-                
-        if len(active) >= cfg.max_positions: 
+
+    cash = cfg.initial_capital
+    active = []
+    accepted = []
+    last_exit_by_ticker = {}
+
+    cand_records = candidates.to_dict("records")
+    for cand in cand_records:
+        entry_date = pd.Timestamp(cand["Entry_Date"])
+        ticker = str(cand["Ticker"])
+
+        if ticker in last_exit_by_ticker and entry_date <= last_exit_by_ticker[ticker] + pd.Timedelta(days=cfg.cooldown_days):
             continue
+
+        release, still_active = [], []
+        for pos in active:
+            exit_dt = pd.Timestamp(pos["Exit_Date"])
+            closed = (exit_dt < entry_date or (cfg.allow_same_day_cash_reuse and exit_dt == entry_date))
+            if closed:
+                release.append(pos)
+            else:
+                still_active.append(pos)
+
+        for pos in release:
+            cash += pos["Shares"] * pos["Exit_Price"] - pos["Exit_Fee"]
+        active = still_active
+
+        # >>> אכיפת מקסימום פוזיציות ואיסור כפילויות <<<
+        if any(pos["Ticker"] == ticker for pos in active): continue
+        if len(active) >= cfg.max_positions: continue
+
+        equity = cash + sum(
+            get_close_on_or_before(data_cache[p["Ticker"]], entry_date, p["Entry_Price"]) * p["Shares"]
+            for p in active
+        )
+
+        entry_price = float(cand["Entry_Price"])
+        stop_price = float(cand["Stop_Price"])
+        exit_price = float(cand["Exit_Price"])
+
+        risk_per_share = max(entry_price - stop_price, 1e-9)
+        max_risk_dollars_trade = equity * cfg.risk_per_trade
+        current_heat = sum(p["Risk_Dollars"] for p in active)
+        max_heat = equity * cfg.max_portfolio_heat
+        remaining_heat = max(0.0, max_heat - current_heat)
+
+        if remaining_heat <= 0: continue
+
+        shares_by_risk = min(max_risk_dollars_trade, remaining_heat) / risk_per_share
+        shares_by_alloc = (equity * cfg.max_alloc_pct) / entry_price
         
-        current_mkt_val = 0
-        for p in active:
-            ticker_df = data_cache[p["Ticker"]]
-            try:
-                curr_p = float(ticker_df.loc[ticker_df.index <= dt].iloc[-1].Close)
-            except:
-                curr_p = p["Entry_Price"]
-            current_mkt_val += curr_p * p["Shares"]
-            
-        equity = cash + current_mkt_val
-        shares = int(min(equity * cfg.max_alloc_pct, cash) / cand["Entry_Price"])
+        # אכיפת מזומן חזקה (כדי שהתיק לא ייכנס למינוס)
+        shares_by_cash = cash / (entry_price * (1 + cfg.commission_bps / 10000))
+
+        shares = int(np.floor(min(shares_by_risk, shares_by_alloc, shares_by_cash)))
+        if shares < 1: continue
+
+        entry_fee = shares * entry_price * cfg.commission_bps / 10000
+        total_cost = shares * entry_price + entry_fee
         
-        if shares > 0:
-            cash -= shares * cand["Entry_Price"] * (1 + cfg.commission_bps/10000)
-            cand["Shares"] = shares
-            cand["Net_PnL"] = (cand["Exit_Price"] - cand["Entry_Price"]) * shares
-            accepted.append(cand)
-            active.append(cand)
-            
-    return pd.DataFrame(accepted)
+        if total_cost > cash: continue
+
+        exit_fee = shares * exit_price * cfg.commission_bps / 10000
+        risk_dollars = shares * risk_per_share
+        cash -= total_cost
+
+        t = cand.copy()
+        t["Shares"] = shares
+        t["Entry_Fee"] = round(entry_fee, 2)
+        t["Exit_Fee"] = round(exit_fee, 2)
+        t["Gross_Entry"] = round(shares * entry_price, 2)
+        t["Gross_Exit"] = round(shares * exit_price, 2)
+        t["Net_PnL"] = round((shares * (exit_price - entry_price)) - entry_fee - exit_fee, 2)
+        t["Alloc_Pct"] = round(shares * entry_price / equity * 100, 2) if equity > 0 else 0.0
+        t["Risk_Dollars"] = round(risk_dollars, 2)
+        
+        accepted.append(t)
+        last_exit_by_ticker[ticker] = pd.Timestamp(t["Exit_Date"])
+        active.append({
+            "Ticker": ticker, "Entry_Date": t["Entry_Date"], "Exit_Date": t["Exit_Date"],
+            "Entry_Price": entry_price, "Exit_Price": exit_price, "Shares": shares, "Exit_Fee": exit_fee,
+            "Risk_Dollars": risk_dollars,
+        })
+
+    if not accepted: return pd.DataFrame()
+    return pd.DataFrame(accepted).sort_values(["Entry_Date", "Exit_Date", "Ticker"]).reset_index(drop=True)
 
 # ==========================================
 # 8. Daily Equity Curve
 # ==========================================
-def get_close_on_or_before(df, dt, fallback):
-    x = df[df.index <= dt]
-    return float(x.iloc[-1].Close) if not x.empty else fallback
+def build_daily_equity_curve(accepted_df: pd.DataFrame, data_cache: dict, benchmark_df: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
+    if accepted_df.empty:
+        return pd.DataFrame(columns=["Date", "Cash", "Market_Value", "Equity", "Drawdown_Pct", "Open_Positions"])
 
-def build_daily_equity_curve(accepted, data_cache, spy, cfg):
-    if accepted.empty: return pd.DataFrame()
-    start_dt, end_dt = pd.Timestamp(f"{cfg.start_year}-01-01"), pd.Timestamp(f"{cfg.end_year}-12-31")
-    trade_dates = [pd.Timestamp(r["Entry_Date"]) for r in accepted.to_dict("records")] + [pd.Timestamp(r["Exit_Date"]) for r in accepted.to_dict("records")]
-    calendar = spy.index.union(pd.DatetimeIndex(trade_dates)).drop_duplicates().sort_values()
-    calendar = calendar[(calendar >= start_dt) & (calendar <= end_dt)]
-    
-    cash, open_pos, rows, peak = cfg.initial_capital, {}, [], cfg.initial_capital
-    entries_by_date = accepted.groupby("Entry_Date").apply(lambda x: x.to_dict("records")).to_dict()
-    exits_by_date = accepted.groupby("Exit_Date").apply(lambda x: x.to_dict("records")).to_dict()
-    
+    start_dt = pd.Timestamp(f"{cfg.start_year}-01-01")
+    end_dt = pd.Timestamp(f"{cfg.end_year}-12-31")
+
+    accepted_records = accepted_df.to_dict("records")
+    trade_dates = [pd.Timestamp(r["Entry_Date"]) for r in accepted_records] + [pd.Timestamp(r["Exit_Date"]) for r in accepted_records]
+    base_calendar = benchmark_df.index
+    full_calendar = base_calendar.union(pd.DatetimeIndex(trade_dates)).drop_duplicates().sort_values()
+    calendar = full_calendar[(full_calendar >= start_dt) & (full_calendar <= end_dt)]
+
+    entries_by_date, exits_by_date = {}, {}
+    for r in accepted_records:
+        entries_by_date.setdefault(pd.Timestamp(r["Entry_Date"]), []).append(r)
+        exits_by_date.setdefault(pd.Timestamp(r["Exit_Date"]), []).append(r)
+
+    cash = cfg.initial_capital
+    open_pos, rows = {}, []
+    running_peak = cfg.initial_capital
+
     for dt in calendar:
-        for r in exits_by_date.get(dt, []):
-            key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]))
-            if key in open_pos:
-                cash += r["Shares"] * r["Exit_Price"] * (1 - cfg.commission_bps/10000)
-                del open_pos[key]
-        for r in entries_by_date.get(dt, []):
-            key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]))
-            open_pos[key] = r
-            cash -= r["Shares"] * r["Entry_Price"] * (1 + cfg.commission_bps/10000)
-            
-        mkt_val = sum(get_close_on_or_before(data_cache[p["Ticker"]], dt, p["Entry_Price"]) * p["Shares"] for p in open_pos.values())
-        equity = cash + mkt_val
-        peak = max(peak, equity)
-        dd = (equity/peak - 1)*100 if peak > 0 else 0
-        rows.append({"Date": dt, "Cash": cash, "Equity": equity, "Drawdown_Pct": dd, "Positions": len(open_pos)})
+        if cfg.allow_same_day_cash_reuse:
+            for r in exits_by_date.get(dt, []):
+                key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
+                if key in open_pos:
+                    cash += float(r["Gross_Exit"]) - float(r["Exit_Fee"])
+                    del open_pos[key]
+            for r in entries_by_date.get(dt, []):
+                key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
+                open_pos[key] = r
+                cash -= float(r["Gross_Entry"]) + float(r["Entry_Fee"])
+        else:
+            for r in entries_by_date.get(dt, []):
+                key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
+                open_pos[key] = r
+                cash -= float(r["Gross_Entry"]) + float(r["Entry_Fee"])
+            for r in exits_by_date.get(dt, []):
+                key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
+                if key in open_pos:
+                    cash += float(r["Gross_Exit"]) - float(r["Exit_Fee"])
+                    del open_pos[key]
+
+        market_value = sum(
+            get_close_on_or_before(data_cache[pos["Ticker"]], dt, float(pos["Entry_Price"])) * float(pos["Shares"])
+            for pos in open_pos.values()
+        )
+        equity = cash + market_value
+        running_peak = max(running_peak, equity)
+        dd = (equity / running_peak - 1.0) * 100 if running_peak > 0 else 0.0
+
+        rows.append({
+            "Date": dt, "Cash": round(cash, 2), "Market_Value": round(market_value, 2),
+            "Equity": round(equity, 2), "Drawdown_Pct": round(dd, 2), "Positions": len(open_pos),
+        })
+
     return pd.DataFrame(rows)
 
 # ==========================================
-# 9. Summaries (Full Version)
+# 9. Summaries
 # ==========================================
 def calc_drawdown(equity_curve: pd.Series) -> float:
     if len(equity_curve) == 0: return 0.0
@@ -428,13 +497,13 @@ def monthly_summary(accepted_df: pd.DataFrame) -> pd.DataFrame:
 def run_backtest_engine(tickers, cfg):
     spy = get_data(cfg.benchmark, "2014-01-01", "2026-03-01", cfg)
     data_cache = {cfg.benchmark: spy}
-    sample_tickers = tickers[:200] 
     
-    for t in tqdm(sample_tickers, desc="Loading Data"):
+    # >>> סריקה מלאה של כל הטיקרים ללא חיתוך <<<
+    for t in tqdm(tickers, desc="Loading Data"):
         data_cache[t] = get_data(t, "2014-01-01", "2026-03-01", cfg)
         
-    cands = generate_candidates(sample_tickers, data_cache, spy, cfg)
-    acc = accept_trades(cands, data_cache, cfg)
+    cands = generate_candidates(tickers, data_cache, spy, cfg)
+    acc = accept_trades_with_portfolio_rules(cands, data_cache, cfg)
     eq = build_daily_equity_curve(acc, data_cache, spy, cfg)
     
     yearly_df = yearly_summary(acc, eq)
@@ -464,7 +533,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("ASCENDING TRIANGLE BACKTEST REPORT (v12 - ATR Padded Stop)")
+    print("STRICT PORTFOLIO VCP BACKTEST REPORT (v13)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
