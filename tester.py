@@ -199,7 +199,7 @@ def market_filter_ok(spy_df: pd.DataFrame, current_date: pd.Timestamp) -> bool:
         return False
 
     # --- סינון קשוח נגד שחיקה ---
-    # סוחרים אך ורק כשהשוק המרכזי מראה מגמת עלייה ברורה (ממוצע 50 מעל 200, והמחיר מעל 50)
+    # סוחרים אך ורק כשהשוק המרכזי מראה מגמת עלייה ברורה
     return float(row["Close"]) > float(row["SMA_50"]) and float(row["SMA_50"]) > float(row["SMA_200"])
 
 def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
@@ -317,17 +317,14 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         profit = (highest_seen / entry_price) - 1
 
         # --- מנגנון ניהול סבלני כדי למנוע יציאות ברייק-איוון (שחיקה) ---
-        # מחכים בסבלנות שהמניה באמת תעשה מהלך (12% במקום 8%) לפני שמקדמים את הסטופ לכניסה
         if profit >= 0.12: 
             stop_price = max(stop_price, entry_price * 1.01)
 
-        # נגרר מהשיא רק כשיש כרית רווח גדולה
         if profit >= 0.20: stop_price = max(stop_price, highest_seen * 0.85)
 
         if day_low <= stop_price:
             exit_p = min(float(row.Open), stop_price) * (1 - cfg.slippage_bps/10000)
             
-            # חישוב הנתונים לדו"ח (כדי שלא יקרוס ה-KeyError)
             gross_pct = (exit_p - entry_price) / entry_price * 100
             net_pct = gross_pct - (2 * cfg.commission_bps / 100)
             risk_per_share = max(entry_price - initial_stop, 1e-9)
@@ -339,7 +336,6 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
                 "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": round(r_multiple, 2)
             }
 
-        # יציאה מבוססת ממוצע 50 (תנו למנצחים הגדולים לרוץ)
         if profit >= 0.15 and day_close < sma_50:
             exit_p = day_close * (1 - cfg.slippage_bps/10000)
             gross_pct = (exit_p - entry_price) / entry_price * 100
@@ -451,7 +447,6 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                 atr = float(today["ATR_14"])
                 if np.isnan(atr) or atr <= 0: continue
 
-                # --- סטופ לוס עם ריפוד ATR מלא (מונע ניעור בעקבות רעש יומי) ---
                 tight_low = float(pattern["tight_low"])
                 calculated_stop = tight_low - (1.0 * atr) 
                 max_allowed_stop = entry_price * (1 - cfg.max_risk_pct)
@@ -569,7 +564,7 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
         accepted.append(t)
         last_exit_by_ticker[ticker] = pd.Timestamp(t["Exit_Date"])
         active.append({
-            "Ticker": ticker, "Entry_Date": t["Entry_Date"], "Exit_Date": t["Exit_Date"],
+            "Ticker": ticker, "Sector": t.get("Sector", "UNKNOWN"), "Entry_Date": t["Entry_Date"], "Exit_Date": t["Exit_Date"],
             "Entry_Price": entry_price, "Exit_Price": exit_price, "Shares": shares, "Exit_Fee": exit_fee,
             "Risk_Dollars": risk_dollars,
         })
@@ -712,7 +707,7 @@ def run_backtest_engine(tickers, cfg):
     for t in tqdm(tickers, desc="Loading Data"):
         data_cache[t] = get_data(t, "2014-01-01", "2026-03-01", cfg)
         
-    cands = generate_candidates(tickers, data_cache, spy, cfg)
+    cands = generate_candidate_trades(tickers, data_cache, spy, cfg)
     acc = accept_trades_with_portfolio_rules(cands, data_cache, cfg)
     eq = build_daily_equity_curve(acc, data_cache, spy, cfg)
     
@@ -743,7 +738,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("ASCENDING TRIANGLE BACKTEST REPORT (v16 - Anti-Grind)")
+    print("ASCENDING TRIANGLE BACKTEST REPORT (v16.1 - Fix)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
