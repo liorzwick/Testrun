@@ -325,17 +325,67 @@ def build_daily_equity_curve(accepted, data_cache, spy, cfg):
     return pd.DataFrame(rows)
 
 # ==========================================
-# 9. Summaries
+# 9. Summaries (Full Version)
 # ==========================================
-def summarize_trades(df):
-    if df.empty: return {"Trades": 0}
-    wins = df[df["Pct"] > 0]
-    return {
-        "Trades": len(df), "WinRate": len(wins)/len(df)*100 if len(df) else 0,
-        "AvgTrade": df["Pct"].mean(), "AvgWin": wins["Pct"].mean() if len(wins) else 0,
-        "AvgLoss": df[df["Pct"] < 0]["Pct"].mean() if len(df[df["Pct"] < 0]) else 0,
-        "NetPnL": df["Net_PnL"].sum() if "Net_PnL" in df else 0
+def calc_drawdown(equity_curve: pd.Series) -> float:
+    if len(equity_curve) == 0: return 0.0
+    dd = (equity_curve / equity_curve.cummax()) - 1.0
+    return round(dd.min() * 100, 2)
+
+def summarize_trades(trades_df: pd.DataFrame, equity_df: pd.DataFrame | None = None) -> dict:
+    empty = {
+        "Trades": 0, "Wins": 0, "Losses": 0, "Win_Rate_Pct": 0.0, 
+        "Avg_Trade_Pct": 0.0, "Avg_Win_Pct": 0.0, "Avg_Loss_Pct": 0.0,
+        "Total_Return_Pct": 0.0, "Max_Drawdown_Pct": 0.0, "Net_PnL": 0.0
     }
+    if trades_df.empty: return empty
+
+    wins = trades_df[trades_df["Pct"] > 0]
+    losses = trades_df[trades_df["Pct"] < 0]
+
+    total_return, max_dd = 0.0, 0.0
+    if equity_df is not None and not equity_df.empty:
+        total_return = round((equity_df["Equity"].iloc[-1] / equity_df["Equity"].iloc[0] - 1.0) * 100, 2)
+        max_dd = calc_drawdown(equity_df["Equity"])
+
+    return {
+        "Trades": len(trades_df), "Wins": len(wins), "Losses": len(losses),
+        "Win_Rate_Pct": round(len(wins) / len(trades_df) * 100, 2) if len(trades_df) > 0 else 0.0,
+        "Avg_Trade_Pct": round(trades_df["Pct"].mean(), 2),
+        "Avg_Win_Pct": round(wins["Pct"].mean(), 2) if len(wins) > 0 else 0.0,
+        "Avg_Loss_Pct": round(losses["Pct"].mean(), 2) if len(losses) > 0 else 0.0,
+        "Total_Return_Pct": total_return, "Max_Drawdown_Pct": max_dd,
+        "Net_PnL": round(trades_df["Net_PnL"].sum(), 2) if "Net_PnL" in trades_df.columns else 0.0,
+    }
+
+def yearly_summary(accepted_df: pd.DataFrame, equity_df: pd.DataFrame) -> pd.DataFrame:
+    if accepted_df.empty: return pd.DataFrame()
+    tmp = accepted_df.copy()
+    tmp["Entry_Date"] = pd.to_datetime(tmp["Entry_Date"])
+    tmp["Year"] = tmp["Entry_Date"].dt.year
+    rows = []
+    for year, g in tmp.groupby("Year"):
+        eq = equity_df[equity_df["Date"].dt.year == year] if not equity_df.empty else pd.DataFrame()
+        s = summarize_trades(g, eq)
+        s["Year"] = year
+        rows.append(s)
+    return pd.DataFrame(rows).sort_values("Year").reset_index(drop=True)
+
+def monthly_summary(accepted_df: pd.DataFrame) -> pd.DataFrame:
+    if accepted_df.empty: return pd.DataFrame()
+    tmp = accepted_df.copy()
+    tmp["Entry_Date"] = pd.to_datetime(tmp["Entry_Date"])
+    tmp["Month"] = tmp["Entry_Date"].dt.to_period("M").astype(str)
+    return (
+        tmp.groupby("Month")
+        .agg(
+            Trades=("Ticker", "count"),
+            Win_Rate_Pct=("Pct", lambda s: round(s.gt(0).sum() / len(s) * 100, 2) if len(s) > 0 else 0),
+            Avg_Trade_Pct=("Pct", lambda s: round(s.mean(), 2)),
+            Net_PnL=("Net_PnL", "sum"),
+        )
+        .reset_index()
+    )
 
 # ==========================================
 # 10. Orchestrator
@@ -343,7 +393,6 @@ def summarize_trades(df):
 def run_backtest_engine(tickers, cfg):
     spy = get_data(cfg.benchmark, "2014-01-01", "2026-03-01", cfg)
     data_cache = {cfg.benchmark: spy}
-    # נריץ על מדגם מספיק גדול לקבלת סטטיסטיקה משמעותית
     sample_tickers = tickers[:200] 
     
     for t in tqdm(sample_tickers, desc="Loading Data"):
@@ -353,34 +402,45 @@ def run_backtest_engine(tickers, cfg):
     acc = accept_trades(cands, data_cache, cfg)
     eq = build_daily_equity_curve(acc, data_cache, spy, cfg)
     
-    return cands, acc, eq
+    yearly_df = yearly_summary(acc, eq)
+    monthly_df = monthly_summary(acc)
+    overall = summarize_trades(acc, eq)
+    
+    return cands, acc, eq, yearly_df, monthly_df, overall
 
 # ==========================================
-# 11. Output Helpers
+# 11. Output Helpers (Full Version)
 # ==========================================
-def save_results(acc, eq):
-    if not acc.empty:
-        acc.to_csv("accepted_trades.csv", index=False)
-    if not eq.empty:
-        eq.to_csv("equity_curve.csv", index=False)
+def save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, overall, cfg: BacktestConfig):
+    out_dir = Path("output") / cfg.output_prefix
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-def print_final_report(acc, eq):
-    if acc.empty:
+    candidates_df.to_csv(out_dir / "candidate_signals.csv", index=False, encoding="utf-8-sig")
+    accepted_df.to_csv(out_dir / "accepted_trades.csv", index=False, encoding="utf-8-sig")
+    equity_df.to_csv(out_dir / "equity_curve.csv", index=False, encoding="utf-8-sig")
+    yearly_df.to_csv(out_dir / "yearly_summary.csv", index=False, encoding="utf-8-sig")
+    monthly_df.to_csv(out_dir / "monthly_summary.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame([overall]).to_csv(out_dir / "overall_summary.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame([asdict(cfg)]).to_csv(out_dir / "config.csv", index=False, encoding="utf-8-sig")
+    print(f"\nFiles saved -> {out_dir}/")
+
+def print_final_report(overall: dict, yearly_df: pd.DataFrame):
+    if not overall or overall.get('Trades', 0) == 0:
         print("No trades executed.")
         return
-    s = summarize_trades(acc)
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 80)
     print("ASCENDING TRIANGLE BACKTEST REPORT (v10)")
-    print("=" * 60)
-    print(f"Total Trades : {s['Trades']}")
-    print(f"Win Rate     : {s['WinRate']:.1f}%")
-    print(f"Avg Trade    : {s['AvgTrade']:.2f}%")
-    print(f"Avg Win      : {s['AvgWin']:.2f}%")
-    print(f"Avg Loss     : {s['AvgLoss']:.2f}%")
-    if not eq.empty:
-        print(f"Total Return : {(eq['Equity'].iloc[-1]/100000 - 1)*100:.2f}%")
-        print(f"Max Drawdown : {eq['Drawdown'].min():.2f}%")
-    print("=" * 60)
+    print("=" * 80)
+    for _, r in yearly_df.iterrows():
+        print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
+    print("-" * 80)
+    print(f" Total Trades  : {overall['Trades']}")
+    print(f" Win Rate      : {overall['Win_Rate_Pct']}%")
+    print(f" Avg Trade     : {overall['Avg_Trade_Pct']}%")
+    print(f" Total Return  : {overall['Total_Return_Pct']}%")
+    print(f" Max Drawdown  : {overall['Max_Drawdown_Pct']}%")
+    print(f" Net PnL       : ${overall.get('Net_PnL', 0):,.0f}")
+    print("=" * 80)
 
 # ==========================================
 # 12. Utilities (Wikipedia Fix)
@@ -401,7 +461,10 @@ def fetch_sp500():
 if __name__ == "__main__":
     cfg = BacktestConfig()
     tickers = fetch_sp500()
-    cands, acc, eq = run_backtest_engine(tickers, cfg)
     
-    save_results(acc, eq)
-    print_final_report(acc, eq)
+    # הפעלת המנוע שמוציא עכשיו את כל 6 הנתונים
+    cands, acc, eq, yearly, monthly, overall = run_backtest_engine(tickers, cfg)
+    
+    # שמירה לכל 7 הקבצים בתיקייה
+    save_outputs(cands, acc, eq, yearly, monthly, overall, cfg)
+    print_final_report(overall, yearly)
