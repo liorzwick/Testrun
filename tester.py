@@ -6,6 +6,7 @@ from pathlib import Path
 import warnings
 import time
 from tqdm import tqdm
+import urllib.request
 import os
 
 warnings.filterwarnings("ignore")
@@ -32,10 +33,10 @@ class BacktestConfig:
     slippage_bps: float = 12
     commission_bps: float = 2
     
-    # מסנני שוק ופריצה (מותאם לשוק הרחב ולמניות Mid-Cap)
+    # --- 3 הדרישות החדשות לסריקה של 2000 מניות ---
     breakout_volume_ratio: float = 1.1 
-    min_dollar_vol_50: float = 20_000_000 
-    min_price: float = 12.0               
+    min_dollar_vol_50: float = 50_000_000 # דרישה 1: רק מניות עם נזילות כבדה של 50 מיליון דולר ביום
+    min_price: float = 20.0               # דרישה 2: חסימת מניות זולות ותנודתיות שמעיפות סטופים
     
     # הסטופ לוס (הנוסחה המנצחת של V15)
     min_risk_pct: float = 0.01         
@@ -49,7 +50,7 @@ class BacktestConfig:
     max_base_depth: float = 0.35       
     max_tightness_depth: float = 0.08  
     min_breakout_close_strength: float = 0.30
-    min_rs_65: float = 0.02            
+    min_rs_65: float = 0.06               # דרישה 3: רק מנהיגות שוק חזקות שמכות את ה-SPY ב-6% לפחות
     max_dist_from_52w_high: float = 0.15
     
     max_pivot_extension: float = 0.04  
@@ -64,7 +65,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v23_mystock_only"
+    output_prefix: str = "canslim_v24_strict_universe"
 
 # ==========================================
 # 1. Data & Indicators
@@ -109,7 +110,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v23.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v24.pkl"
 
     if cache_file.exists():
         return pd.read_pickle(cache_file)
@@ -713,7 +714,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("BROAD MARKET VCP BACKTEST REPORT (v23 - mystock.csv ONLY)")
+    print("BROAD MARKET VCP BACKTEST REPORT (v24 - Strict Universe)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
@@ -730,7 +731,6 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
 # 12. Utilities (Strict Loading of Custom File)
 # ==========================================
 def get_tickers(cfg: BacktestConfig):
-    # הפונקציה הזו תעצור את הריצה אם הקובץ לא תקין, ולא תחזור ל-S&P 500
     if cfg.custom_tickers_file and os.path.exists(cfg.custom_tickers_file):
         try:
             df = pd.read_csv(cfg.custom_tickers_file)
@@ -759,7 +759,6 @@ def get_tickers(cfg: BacktestConfig):
 if __name__ == "__main__":
     cfg = BacktestConfig()
     
-    # טעינת המניות אך ורק מהקובץ. יעצור ויקרוס אם הקובץ לא נמצא
     tickers = get_tickers(cfg)
     
     cands, acc, eq, yearly, monthly, overall = run_backtest_engine(tickers, cfg)
