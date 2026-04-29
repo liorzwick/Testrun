@@ -21,27 +21,27 @@ class BacktestConfig:
     initial_capital: float = 100_000.0
     risk_per_trade: float = 0.005      
     
-    # ניהול תיק (פיזור אופטימלי)
-    max_alloc_pct: float = 0.12        
-    max_positions: int = 10            
+    # ניהול תיק 
+    max_alloc_pct: float = 0.15        
+    max_positions: int = 8             
     max_portfolio_heat: float = 0.04   
     cooldown_days: int = 15
     slippage_bps: float = 12
     commission_bps: float = 2
     
     # מסנני שוק ופריצה
-    breakout_volume_ratio: float = 1.1 
+    breakout_volume_ratio: float = 1.15 
     min_dollar_vol_50: float = 25_000_000
     min_price: float = 15.0
     
-    # --- הסטופ ההדוק החדש (ללא Take Profit) ---
-    min_risk_pct: float = 0.005        # נאפשר סטופ קרוב ברמת חצי אחוז!
-    max_risk_pct: float = 0.04         # הסטופ ההדוק מוגבל למקסימום 4%
+    # --- הסטופ החכם (השילוב המנצח) ---
+    min_risk_pct: float = 0.01         
+    max_risk_pct: float = 0.07         # מאפשרים עד 7% לסטופ הראשוני כדי לחמוק מרעשי עושי שוק
     max_hold_bars: int = 250           # נותנים למנצחים לרוץ עד שנה
     time_stop_bars: int = 35           
     min_profit_after_time_stop: float = 0.01 
     
-    # פרמטרים גיאומטריים של משולש עולה (VCP)
+    # פרמטרים של משולש עולה (VCP)
     min_prior_uptrend: float = 0.08    
     max_base_depth: float = 0.35       
     max_tightness_depth: float = 0.08  
@@ -49,20 +49,12 @@ class BacktestConfig:
     min_rs_65: float = 0.02            
     max_dist_from_52w_high: float = 0.15
     
-    min_cup_depth: float = 0.04
-    max_cup_depth: float = 0.35
-    max_handle_depth: float = 0.10
-    min_handle_days: int = 3
-    max_handle_days: int = 20
-    min_cup_days: int = 15
-    max_cup_days: int = 200
+    # דיוק כניסה הגיוני (לא חנוק מדי)
+    max_pivot_extension: float = 0.04  
+    max_entry_extension: float = 0.035 
+    max_gap_above_pivot: float = 0.02 
     
-    # --- דיוק הכניסה לפריצה ---
-    max_pivot_extension: float = 0.03  # לא רודפים אחרי מניה שקפצה יותר מ-3% מעל ההתנגדות
-    max_entry_extension: float = 0.025 
-    max_gap_above_pivot: float = 0.015 # גאפ מקסימלי של 1.5% בלבד
-    
-    early_exit_bars: int = 10          
+    early_exit_bars: int = 15          
     early_exit_min_progress: float = -0.02 
     min_tight_closes_in_handle: int = 0
     
@@ -70,7 +62,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v18_surgical_stop"
+    output_prefix: str = "canslim_v19_smart_stops"
 
 # ==========================================
 # 1. Data & Indicators
@@ -115,7 +107,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v18.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v19.pkl"
 
     if cache_file.exists():
         return pd.read_pickle(cache_file)
@@ -158,19 +150,11 @@ def market_filter_ok(spy_df: pd.DataFrame, current_date: pd.Timestamp) -> bool:
     if len(x) < 220: return False
 
     row = x.iloc[-1]
-    sma200_old = x["SMA_200"].iloc[-20]
 
-    if any(pd.isna(row[c]).any() if isinstance(row[c], pd.Series) else pd.isna(row[c]) for c in ["SMA_50", "SMA_150", "SMA_200", "ROC_20", "ROC_65"]):
-        return False
-    if pd.isna(sma200_old).any() if isinstance(sma200_old, pd.Series) else pd.isna(sma200_old):
+    if any(pd.isna(row[c]).any() if isinstance(row[c], pd.Series) else pd.isna(row[c]) for c in ["SMA_50", "SMA_200"]):
         return False
 
-    return (
-        float(row["Close"]) > float(row["SMA_50"]) > float(row["SMA_150"]) > float(row["SMA_200"]) and 
-        float(row["SMA_200"]) > float(sma200_old) and
-        float(row["ROC_20"]) > -0.03 and 
-        float(row["ROC_65"]) > 0
-    )
+    return float(row["Close"]) > float(row["SMA_50"]) and float(row["SMA_50"]) > float(row["SMA_200"])
 
 def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     required = ["SMA_21", "SMA_50", "SMA_150", "SMA_200", "Vol_50", "ATR_14", "ATR_Pct", "ROC_65", "DollarVol_50", "High_252"]
@@ -261,7 +245,7 @@ def compute_signal_score(pattern_score: float, rs_65: float, volume_ratio: float
     return round(pattern_score + rs_component + vol_component + near_high_component + cs_component, 4)
 
 # ==========================================
-# 5. Patient Trade Simulation (ATR Trailing & SMA 50 Exit)
+# 5. Smart Trailing Stop & SMA 50 System
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -282,17 +266,22 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         day_high = float(row.High)
         day_close = float(row.Close)
         sma_50 = float(getattr(row, "SMA_50", 0.0))
-        atr_live = float(getattr(row, "ATR_14", 0.0))
-        
-        if atr_live == 0 or pd.isna(atr_live):
-            atr_live = entry_price * 0.02
+        atr_live = float(getattr(row, "ATR_14", entry_price * 0.02))
 
         stop_today = stop_next_day
         highest_seen = max(highest_seen, day_high)
         lowest_seen = min(lowest_seen, day_low)
         profit = (highest_seen / entry_price) - 1
 
-        # 1. בדיקת פגיעה בסטופ (הראשוני או הנגרר)
+        # --- הסטופ המבני: נגרר 3 ATR מתחת לשיא כדי לחמוק מניעורים ---
+        if highest_seen > entry_price:
+            stop_next_day = max(stop_today, highest_seen - (3.0 * atr_live))
+
+        # מעבר לברייק-איוון רק כשיש רווח משמעותי שמגן עלינו
+        if profit >= 0.10:
+            stop_next_day = max(stop_next_day, entry_price * 1.005)
+
+        # פגיעה בסטופ-לוס (הראשוני או הנגרר)
         if day_low <= stop_today:
             exit_p = min(float(row.Open), stop_today) * (1 - cfg.slippage_bps/10000)
             
@@ -307,16 +296,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
                 "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": round(r_multiple, 2)
             }
 
-        # 2. עדכון הסטופ הנגרר לפי ATR (מתרחק כשהמניה עולה כדי למנוע ניעור)
-        new_stop = max(stop_today, highest_seen - 2.5 * atr_live)
-        
-        # הבטחת ברייק איוון אחרי רווח קטן
-        if profit >= 0.05:
-            new_stop = max(new_stop, entry_price * 1.005)
-
-        stop_next_day = new_stop
-
-        # 3. הגנת שבירת ממוצע 50 למנצחים הגדולים
+        # --- חיתוך מנצחים רק אם שברו SMA 50 ---
         if profit >= 0.15 and day_close < sma_50:
             exit_p = day_close * (1 - cfg.slippage_bps/10000)
             gross_pct = (exit_p - entry_price) / entry_price * 100
@@ -327,7 +307,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
                 "MAE_Pct": round((lowest_seen/entry_price-1)*100, 2), "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)
             }
 
-        # 4. חיתוך הפסדים או שעמום
+        # יציאות על זמן ושעמום
         if i >= cfg.time_stop_bars and (day_close/entry_price-1) < cfg.min_profit_after_time_stop:
             exit_p = day_close * (1 - cfg.slippage_bps/10000)
             gross_pct = (exit_p - entry_price) / entry_price * 100
@@ -355,11 +335,11 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
     }
 
 # ==========================================
-# 6. Candidate generation
+# 6. Candidate Generation
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, universe_df=None):
     candidates = []
-    print("\nScanning for Ascending Triangle signals (Surgical Stop Mode)...")
+    print("\nScanning for Ascending Triangle signals (Smart Structural Stops)...")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -420,7 +400,6 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                 entry_date = next_bar.index[0]
                 entry_open = float(next_bar.iloc[0]["Open"])
 
-                # דיוק כניסה - קונים רק אם המניה לא פתחה בגאפ מטורף
                 gap_from_pivot = (entry_open / pivot) - 1.0
                 if gap_from_pivot > cfg.max_gap_above_pivot: continue
 
@@ -430,18 +409,17 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                 atr = float(today["ATR_14"])
                 if np.isnan(atr) or atr <= 0: continue
 
-                # --- הסטופ הראשוני והכירורגי ---
-                # אם המניה נופלת 1.5% חזרה מתחת לקו ההתנגדות - זו פריצת שווא בוודאות.
-                stop_from_pivot = pivot * 0.985
-                stop_from_atr = entry_price - (1.0 * atr)
-                
-                # ניקח את הגבוה (ההדוק) מביניהם
-                initial_stop = max(stop_from_pivot, stop_from_atr)
-                
-                # ונוודא שבכל מקרה לא נפסיד יותר מ-4% על פריצת שווא
+                # --- הסטופ ההגיוני (מתחת לבסיס האחרון + הגנת ATR) ---
+                tight_low = float(pattern["tight_low"])
+                calculated_stop = tight_low - atr 
                 max_allowed_stop = entry_price * (1 - cfg.max_risk_pct)
-                initial_stop = max(initial_stop, max_allowed_stop)
                 
+                # אנחנו לוקחים את הגבוה (ההדוק מביניהם) כדי למנוע הפסדים גדולים
+                initial_stop = max(calculated_stop, max_allowed_stop)
+                
+                if initial_stop >= entry_price:
+                    initial_stop = entry_price * 0.985
+                    
                 risk_pct = (entry_price - initial_stop) / entry_price
                 if not (cfg.min_risk_pct <= risk_pct <= cfg.max_risk_pct): continue
 
@@ -711,7 +689,7 @@ def run_backtest_engine(tickers, cfg):
     return cands, acc, eq, yearly_df, monthly_df, overall
 
 # ==========================================
-# 11. Output Helpers
+# 11. Output Helpers 
 # ==========================================
 def save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, overall, cfg: BacktestConfig):
     out_dir = Path("output") / cfg.output_prefix
@@ -731,7 +709,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("ASCENDING TRIANGLE BACKTEST REPORT (v18 - Surgical Stop & Let Runners Run)")
+    print("ASCENDING TRIANGLE BACKTEST REPORT (v19 - Structural Stops)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
