@@ -31,13 +31,13 @@ class BacktestConfig:
     commission_bps: float = 2
     
     # --- הפסקת השחיקה (Anti-Grind Filters) ---
-    breakout_volume_ratio: float = 1.3 # דרישה חזקה למעורבות מוסדית ביום הפריצה (זינוק בווליום)
+    breakout_volume_ratio: float = 1.3 
     min_dollar_vol_50: float = 25_000_000
     min_price: float = 15.0
     
     # ניהול טרייד (נותנים למניה לנשום!)
     min_risk_pct: float = 0.01         
-    max_risk_pct: float = 0.07         # הגדלנו ל-7% כדי לאפשר ל-ATR להרחיק את הסטופ מ"רעש" השוק
+    max_risk_pct: float = 0.07         
     max_hold_bars: int = 250           
     time_stop_bars: int = 35           
     min_profit_after_time_stop: float = 0.01 
@@ -61,7 +61,7 @@ class BacktestConfig:
     max_entry_extension: float = 0.03  
     max_gap_above_pivot: float = 0.02
     
-    early_exit_bars: int = 15          # נותנים 3 שבועות (במקום שבועיים) כדי לא לצאת מוקדם מדי על פול-באק
+    early_exit_bars: int = 15          
     early_exit_min_progress: float = -0.02 
     min_tight_closes_in_handle: int = 0
     
@@ -198,8 +198,6 @@ def market_filter_ok(spy_df: pd.DataFrame, current_date: pd.Timestamp) -> bool:
     if any(pd.isna(row[c]).any() if isinstance(row[c], pd.Series) else pd.isna(row[c]) for c in ["SMA_50", "SMA_200"]):
         return False
 
-    # --- סינון קשוח נגד שחיקה ---
-    # סוחרים אך ורק כשהשוק המרכזי מראה מגמת עלייה ברורה
     return float(row["Close"]) > float(row["SMA_50"]) and float(row["SMA_50"]) > float(row["SMA_200"])
 
 def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
@@ -275,9 +273,18 @@ def get_ascending_triangle_signal(pattern_data: pd.DataFrame, cfg: BacktestConfi
 
     pivot = max(peak1_price, peak2_price)
 
+    # הוספת הערכים המלאים למילון כדי למנוע את שגיאת ה-KeyError בדוחות
     return {
         "pivot_price": pivot, 
-        "tight_low": valley2_price 
+        "handle_low": valley1_price,
+        "tight_low": valley2_price,
+        "cup_depth_pct": base_depth,
+        "handle_depth_pct": tightness,
+        "cup_length": int(valley1_pos - peak1_pos),
+        "handle_length": int(len(recent) - peak2_pos),
+        "prior_uptrend": 0.1,  
+        "tightness": tightness,
+        "score": 1.0           
     }
 
 def compute_signal_score(pattern_score: float, rs_65: float, volume_ratio: float, dist_52w: float, close_strength: float) -> float:
@@ -288,7 +295,7 @@ def compute_signal_score(pattern_score: float, rs_65: float, volume_ratio: float
     return round(pattern_score + rs_component + vol_component + near_high_component + cs_component, 4)
 
 # ==========================================
-# 5. Patient Trade Simulation (Anti-Shakeout)
+# 5. Patient Trade Simulation
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -316,7 +323,6 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         lowest_seen = min(lowest_seen, day_low)
         profit = (highest_seen / entry_price) - 1
 
-        # --- מנגנון ניהול סבלני כדי למנוע יציאות ברייק-איוון (שחיקה) ---
         if profit >= 0.12: 
             stop_price = max(stop_price, entry_price * 1.01)
 
@@ -465,6 +471,9 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                     "Signal_Date": current_date, "Entry_Date": entry_date, "Entry_Price": round(entry_price, 2),
                     "Exit_Date": sim["Exit_Date"], "Exit_Price": round(sim["Exit_Price"], 2), "Pct_Change": sim["Pct_Change"],
                     "Risk_Pct": round(risk_pct * 100, 2), "Stop_Price": round(initial_stop, 2),
+                    "Cup_Depth_Pct": round(pattern["cup_depth_pct"] * 100, 2), "Handle_Depth_Pct": round(pattern["handle_depth_pct"] * 100, 2),
+                    "Cup_Length": int(pattern["cup_length"]), "Handle_Length": int(pattern["handle_length"]),
+                    "Prior_Uptrend_Pct": round(pattern["prior_uptrend"] * 100, 2), "Handle_Tightness": pattern["tightness"],
                     "Volume_Ratio": round(vol_ratio, 2), "RS_65": round(stock_rs, 4), "Dist_52W_High": round(dist_52w, 4),
                     "Close_Strength": round(close_strength, 4), "Gap_From_Pivot": round(gap_from_pivot, 4),
                     "Hold_Bars": sim["Hold_Bars"], "Result": classify_pnl(sim["Pct_Change"]),
@@ -718,7 +727,7 @@ def run_backtest_engine(tickers, cfg):
     return cands, acc, eq, yearly_df, monthly_df, overall
 
 # ==========================================
-# 11. Output Helpers 
+# 11. Output Helpers
 # ==========================================
 def save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, overall, cfg: BacktestConfig):
     out_dir = Path("output") / cfg.output_prefix
@@ -738,7 +747,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("ASCENDING TRIANGLE BACKTEST REPORT (v16.1 - Fix)")
+    print("ASCENDING TRIANGLE BACKTEST REPORT (v16.2 - Anti-Grind)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
