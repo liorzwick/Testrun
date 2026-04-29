@@ -29,17 +29,17 @@ class BacktestConfig:
     
     # פרמטרים גיאומטריים - משולש עולה (Ascending Triangle)
     min_prior_uptrend: float = 0.08    
-    max_base_depth: float = 0.35       # העמק הראשון יכול לרדת עד 35%
-    max_tightness_depth: float = 0.08  # העמק השני (הכיווץ האחרון) מוגבל ל-8% מהתקרה
+    max_base_depth: float = 0.35       
+    max_tightness_depth: float = 0.08  
     min_breakout_close_strength: float = 0.30
     max_pivot_extension: float = 0.04  
     max_dist_from_52w_high: float = 0.15
     min_price: float = 15.0
     min_dollar_vol_50: float = 25_000_000
     
-    # ניהול טרייד - סטופ הדוק מתחת לפריצה וסבלנות ברווח
-    min_risk_pct: float = 0.01         # נאפשר סטופ קרוב מאוד (1%)
-    max_risk_pct: float = 0.045        # הסטופ ההדוק מוגבל ל-4.5% הפסד לכל היותר
+    # ניהול טרייד
+    min_risk_pct: float = 0.01         
+    max_risk_pct: float = 0.045        
     early_exit_bars: int = 10          
     early_exit_min_progress: float = -0.02 
     time_stop_bars: int = 35           
@@ -60,6 +60,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if getattr(df.index, "tz", None) is not None:
         df.index = df.index.tz_localize(None)
     df = df.sort_index()
+    
+    # הסרת כפילויות במקרה של נתוני יאהו משובשים
+    df = df[~df.index.duplicated(keep='first')]
+
     df["SMA_50"] = df["Close"].rolling(50).mean()
     df["SMA_150"] = df["Close"].rolling(150).mean()
     df["SMA_200"] = df["Close"].rolling(200).mean()
@@ -119,58 +123,60 @@ def get_ascending_triangle_signal(pattern_data: pd.DataFrame, cfg: BacktestConfi
     recent = pattern_data.tail(150)
     if len(recent) < 60: return None
 
-    # --- שלב 1: מציאת השיא המרכזי (קביעת קו ההתנגדות) ---
-    peak1_idx = recent["High"].iloc[:-10].idxmax()
-    peak1_price = float(recent.loc[peak1_idx, "High"])
-    peak1_pos = recent.index.get_loc(peak1_idx)
+    # שימוש במערכי numpy כדי למנוע קריסה מאינדקסים כפולים (Duplicate DatetimeIndex)
+    highs = recent["High"].values
+    lows = recent["Low"].values
 
-    if peak1_pos < 30: return None # צריך בסיס מינימלי
+    # --- שלב 1: מציאת השיא המרכזי ---
+    slice1 = highs[:-10]
+    if len(slice1) == 0: return None
+    peak1_pos = int(np.argmax(slice1))
+    peak1_price = float(slice1[peak1_pos])
+
+    if peak1_pos < 30: return None 
 
     # --- שלב 2: העמק הראשון (הנסיגה הגדולה) ---
-    post_peak1 = recent.iloc[peak1_pos+1 : -5]
-    if len(post_peak1) < 10: return None
+    post_peak1_lows = lows[peak1_pos+1 : -5]
+    if len(post_peak1_lows) < 10: return None
 
-    valley1_idx = post_peak1["Low"].idxmin()
-    valley1_price = float(post_peak1.loc[valley1_idx, "Low"])
-    valley1_pos = recent.index.get_loc(valley1_idx)
+    valley1_pos_rel = int(np.argmin(post_peak1_lows))
+    valley1_price = float(post_peak1_lows[valley1_pos_rel])
+    valley1_pos = peak1_pos + 1 + valley1_pos_rel
 
     base_depth = (peak1_price - valley1_price) / peak1_price
     if base_depth > cfg.max_base_depth: return None
 
     # --- שלב 3: בדיקת התנגדות (פסגה שניה) ---
-    # המניה מנסה לעלות שוב לאזור השיא הראשון ונבלמת
-    post_valley1 = recent.iloc[valley1_pos+1 : -2]
-    if len(post_valley1) < 5: return None
+    post_valley1_highs = highs[valley1_pos+1 : -2]
+    if len(post_valley1_highs) < 5: return None
 
-    peak2_idx = post_valley1["High"].idxmax()
-    peak2_price = float(post_valley1.loc[peak2_idx, "High"])
-    peak2_pos = recent.index.get_loc(peak2_idx)
+    peak2_pos_rel = int(np.argmax(post_valley1_highs))
+    peak2_price = float(post_valley1_highs[peak2_pos_rel])
+    peak2_pos = valley1_pos + 1 + peak2_pos_rel
 
-    # התקרה חייבת להיות ישרה פחות או יותר (מרחק של מקסימום 4% מטה משיא 1, ולא פורצת ממנו למעלה בהרבה)
     if peak2_price < peak1_price * 0.96 or peak2_price > peak1_price * 1.02:
         return None
 
     # --- שלב 4: העמק השני (שפלים עולים וכיווץ) ---
-    post_peak2 = recent.iloc[peak2_pos+1 :]
-    if len(post_peak2) < 3: return None
+    post_peak2_lows = lows[peak2_pos+1 :]
+    if len(post_peak2_lows) < 3: return None
 
-    valley2_price = float(post_peak2["Low"].min())
+    valley2_price = float(np.min(post_peak2_lows))
     
-    # חוק השפלים העולים: העמק השני חייב להיות גבוה ב-2% לפחות מהעמק הראשון
+    # חוק השפלים העולים
     if valley2_price <= valley1_price * 1.02: 
         return None
 
-    # חוק ההידוק: העמק השני מגלם את הכיווץ הסופי לפני הפריצה (קרוב לתקרה)
+    # חוק ההידוק: כיווץ סופי לפני הפריצה
     tightness = (peak2_price - valley2_price) / peak2_price
     if tightness > cfg.max_tightness_depth: 
         return None
 
-    # קו ההתנגדות הסופי (הפיווט) יהיה הגבוה מבין שתי הפסגות
     pivot = max(peak1_price, peak2_price)
 
     return {
         "pivot_price": pivot, 
-        "tight_low": valley2_price # הנמוך ההדוק שממנו נגזור את הסטופ!
+        "tight_low": valley2_price 
     }
 
 # ==========================================
@@ -180,15 +186,12 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
     future = df[df.index >= entry_date].head(cfg.max_hold_bars)
     if future.empty: return None
     
-    # --- סטופ לוס גיאומטרי והדוק ---
-    # ממקמים את הסטופ ממש סנטימטר מתחת לשפל העולה האחרון (הכיווץ).
-    # במקביל מגינים שלא יהיה רחוק יותר מ-max_risk_pct כדי למנוע שחיקה.
     calculated_stop = tight_low * 0.99
     max_loss_stop = entry_price * (1 - cfg.max_risk_pct)
     stop_price = max(calculated_stop, max_loss_stop)
     
     if stop_price >= entry_price:
-        stop_price = entry_price * 0.985 # הגנה למקרה של גאפ אפ
+        stop_price = entry_price * 0.985 
         
     highest_seen = float(entry_price)
 
@@ -200,7 +203,6 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         highest_seen = max(highest_seen, day_high)
         profit = (highest_seen / entry_price) - 1
 
-        # מנגנון ברייק-איוון סבלני
         if profit >= 0.06: stop_price = max(stop_price, entry_price * 1.005)
         if profit >= 0.15: stop_price = max(stop_price, highest_seen * 0.90)
         if profit >= 0.25: stop_price = max(stop_price, highest_seen * 0.88)
@@ -237,7 +239,6 @@ def generate_candidates(tickers, data_cache, spy_df, cfg):
                 prev_close = float(past.iloc[-2].Close)
                 pivot = pattern['pivot_price']
                 
-                # זיהוי שבירת קו ההתנגדות
                 if curr_close > pivot and prev_close <= pivot:
                     if curr_close <= pivot * (1+cfg.max_pivot_extension):
                         if i+1 >= len(df): continue
@@ -273,7 +274,10 @@ def accept_trades(candidates, data_cache, cfg):
         current_mkt_val = 0
         for p in active:
             ticker_df = data_cache[p["Ticker"]]
-            curr_p = float(ticker_df.loc[ticker_df.index <= dt].iloc[-1].Close)
+            try:
+                curr_p = float(ticker_df.loc[ticker_df.index <= dt].iloc[-1].Close)
+            except:
+                curr_p = p["Entry_Price"]
             current_mkt_val += curr_p * p["Shares"]
             
         equity = cash + current_mkt_val
@@ -321,7 +325,7 @@ def build_daily_equity_curve(accepted, data_cache, spy, cfg):
         equity = cash + mkt_val
         peak = max(peak, equity)
         dd = (equity/peak - 1)*100 if peak > 0 else 0
-        rows.append({"Date": dt, "Cash": cash, "Equity": equity, "Drawdown": dd, "Positions": len(open_pos)})
+        rows.append({"Date": dt, "Cash": cash, "Equity": equity, "Drawdown_Pct": dd, "Positions": len(open_pos)})
     return pd.DataFrame(rows)
 
 # ==========================================
@@ -429,7 +433,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("ASCENDING TRIANGLE BACKTEST REPORT (v10)")
+    print("ASCENDING TRIANGLE BACKTEST REPORT (v10.1)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
@@ -462,9 +466,7 @@ if __name__ == "__main__":
     cfg = BacktestConfig()
     tickers = fetch_sp500()
     
-    # הפעלת המנוע שמוציא עכשיו את כל 6 הנתונים
     cands, acc, eq, yearly, monthly, overall = run_backtest_engine(tickers, cfg)
     
-    # שמירה לכל 7 הקבצים בתיקייה
     save_outputs(cands, acc, eq, yearly, monthly, overall, cfg)
     print_final_report(overall, yearly)
