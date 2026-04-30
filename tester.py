@@ -32,24 +32,24 @@ class BacktestConfig:
     slippage_bps: float = 12
     commission_bps: float = 2
     
-    # מסנני שוק ופריצה
+    # מסנני שוק ופריצה למניות רחבות
     breakout_volume_ratio: float = 1.1 
-    min_dollar_vol_50: float = 30_000_000 # נזילות יפה שמסננת מניפולציות
+    min_dollar_vol_50: float = 30_000_000 
     min_price: float = 15.0               
     
-    # --- מערכת ניהול הזמן והסיכון (V26) ---
+    # מערכת ניהול הזמן והסיכון (V26/V27)
     min_risk_pct: float = 0.01         
-    max_risk_pct: float = 0.06         # מאפשר מרווח בטוח למניות תנודתיות
+    max_risk_pct: float = 0.06         
     max_hold_bars: int = 250           
-    time_stop_bars: int = 20           # חותכים מניות משעממות תוך 20 ימי מסחר!
-    min_profit_after_time_stop: float = 0.015 # חותכים אם אין לפחות 1.5% רווח
+    time_stop_bars: int = 20           
+    min_profit_after_time_stop: float = 0.015 
     
     # פרמטרים גיאומטריים (VCP)
     min_prior_uptrend: float = 0.08    
     max_base_depth: float = 0.35       
     max_tightness_depth: float = 0.08  
     min_breakout_close_strength: float = 0.35
-    min_rs_65: float = 0.04            # עוצמה יחסית חזקה למניות מנהיגות
+    min_rs_65: float = 0.04            
     max_dist_from_52w_high: float = 0.15
     
     max_pivot_extension: float = 0.04  
@@ -64,7 +64,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v26_timestop_20"
+    output_prefix: str = "canslim_v27_smart_market_filter"
 
 # ==========================================
 # 1. Data & Indicators
@@ -100,7 +100,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         (df["Low"] - df["Prev_Close"]).abs(),
     ], axis=1).max(axis=1)
     df["ATR_14"] = tr.rolling(14).mean()
-    # הגנה מחלוקה באפס
     df["ATR_Pct"] = df["ATR_14"] / np.where(df["Close"] > 0, df["Close"], 1e-9)
 
     return df
@@ -109,7 +108,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v26.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v27.pkl"
 
     if cache_file.exists():
         try:
@@ -155,19 +154,13 @@ def market_filter_ok(spy_df: pd.DataFrame, current_date: pd.Timestamp) -> bool:
     if len(x) < 220: return False
 
     row = x.iloc[-1]
-    sma200_old = x["SMA_200"].iloc[-20]
-
-    if any(pd.isna(row[c]).any() if isinstance(row[c], pd.Series) else pd.isna(row[c]) for c in ["SMA_50", "SMA_150", "SMA_200", "ROC_20", "ROC_65"]):
-        return False
-    if pd.isna(sma200_old).any() if isinstance(sma200_old, pd.Series) else pd.isna(sma200_old):
+    
+    if pd.isna(row["SMA_200"]) or pd.isna(row["SMA_21"]): 
         return False
 
-    return (
-        float(row["Close"]) > float(row["SMA_50"]) > float(row["SMA_150"]) > float(row["SMA_200"]) and 
-        float(row["SMA_200"]) > float(sma200_old) and
-        float(row["ROC_20"]) > -0.03 and 
-        float(row["ROC_65"]) > 0
-    )
+    # >>> הפילטר החכם (V27): השוק ירוק ברגע שעלה מעל ממוצע 200 ומגמת הטווח הקצר (21) חיובית.
+    # זה מונע שביתה ארוכה מדי ומכניס את הבוט לפעולה ישר בתחילת העליות.
+    return float(row["Close"]) > float(row["SMA_200"]) and float(row["Close"]) > float(row["SMA_21"])
 
 def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     required = ["SMA_21", "SMA_50", "SMA_150", "SMA_200", "Vol_50", "ATR_14", "ATR_Pct", "ROC_65", "DollarVol_50", "High_252"]
@@ -258,7 +251,7 @@ def compute_signal_score(pattern_score: float, rs_65: float, volume_ratio: float
     return round(pattern_score + rs_component + vol_component + near_high_component + cs_component, 4)
 
 # ==========================================
-# 5. Patient Trade Simulation (Time Stop 20 & Trailing)
+# 5. Patient Trade Simulation
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -287,7 +280,6 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 
         stop_today = initial_stop if i == 0 else stop_next_day
 
-        # פער (Gap) נגדנו מתחת לסטופ בפתיחת המסחר
         if day_open <= stop_today:
             final_exit_price = day_open * (1 - cfg.slippage_bps / 10000)
             gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
@@ -299,7 +291,6 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
                 "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)
             }
 
-        # חיתוך הפסד (Stop Hit) במהלך היום
         if day_low <= stop_today:
             final_exit_price = stop_today * (1 - cfg.slippage_bps / 10000)
             gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
@@ -315,15 +306,13 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         lowest_seen = min(lowest_seen, day_low)
         profit_high = (highest_seen - entry_price) / max(entry_price, 1e-9)
         
-        # --- הגנות מנצחים והעלאת סטופ אוטומטית ---
         new_stop = stop_today
-        if profit_high >= 0.08: new_stop = max(new_stop, entry_price * 1.005) # ברייק-איוון מהיר
-        if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.90) # טריילינג סטופ 10%
-        if profit_high >= 0.30: new_stop = max(new_stop, highest_seen * 0.85) # טריילינג סטופ 15%
+        if profit_high >= 0.08: new_stop = max(new_stop, entry_price * 1.005) 
+        if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.90) 
+        if profit_high >= 0.30: new_stop = max(new_stop, highest_seen * 0.85) 
 
         stop_next_day = max(stop_today, new_stop)
 
-        # יציאה מוקדמת למניות חלשות
         if (i + 1) == cfg.early_exit_bars:
             if (day_close / max(entry_price, 1e-9)) - 1.0 < cfg.early_exit_min_progress:
                 final_exit_price = day_close * (1 - cfg.slippage_bps / 10000)
@@ -335,7 +324,6 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
                     "MAE_Pct": round((lowest_seen/max(entry_price, 1e-9)-1)*100, 2), "R_Multiple": 0.0
                 }
 
-        # --- יציאת זמן (Time Stop) אגרסיבית אחרי 20 יום ---
         if (i + 1) >= cfg.time_stop_bars:
             if (day_close - entry_price) / max(entry_price, 1e-9) < cfg.min_profit_after_time_stop:
                 final_exit_price = day_close * (1 - cfg.slippage_bps / 10000)
@@ -347,7 +335,6 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
                     "MAE_Pct": round((lowest_seen/max(entry_price, 1e-9)-1)*100, 2), "R_Multiple": 0.0
                 }
 
-    # יציאה סופית למנצחות ארוכות טווח
     final_exit_price = float(future.iloc[-1]["Close"]) * (1 - cfg.slippage_bps / 10000)
     gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
     net_pct = gross_pct - (2 * cfg.commission_bps / 100)
@@ -363,7 +350,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, universe_df=None):
     candidates = []
-    print(f"\nScanning for signals in {len(tickers)} stocks with strict 20-Day Time Stop...")
+    print(f"\nScanning for signals in {len(tickers)} stocks with Smart Market Filter...")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -730,7 +717,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v26 - 20-Day Time Stop & Strict Risk)")
+    print("VCP BACKTEST REPORT (v27 - Smart Market Filter)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
