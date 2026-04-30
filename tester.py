@@ -30,23 +30,23 @@ class BacktestConfig:
     slippage_bps: float = 12
     commission_bps: float = 2
     
-    # --- דרישות חותמת מוסדית (V28) ---
-    breakout_volume_ratio: float = 1.40  # דורשים פיצוץ ווליום של לפחות +40%
+    # --- שביל הזהב: נותנים לבוט לנשום (V29) ---
+    breakout_volume_ratio: float = 1.25  # ירד מ-1.4 כדי להגדיל כמות עסקאות (עדיין 25% מעל הממוצע)
     min_dollar_vol_50: float = 30_000_000 
     min_price: float = 15.0               
     
-    # ניהול זמן וסיכון להעלאת ה-Average Trade
+    # ניהול זמן וסיכון
     min_risk_pct: float = 0.01         
-    max_risk_pct: float = 0.05         # חותכים הפסדים מקסימליים בחזרה ל-5%
+    max_risk_pct: float = 0.06         # טיפה יותר מרווח לסטופים כדי לא לפסול עסקאות טובות
     max_hold_bars: int = 150           
-    time_stop_bars: int = 15           # חותכים כסף מת מהר יותר (15 יום במקום 20)
-    min_profit_after_time_stop: float = 0.02 # אם אין 2% רווח תוך 3 שבועות - בחוץ
+    time_stop_bars: int = 18           # נותנים למניה קצת יותר משבועיים להוכיח את עצמה
+    min_profit_after_time_stop: float = 0.015 
     
-    # --- גיאומטריה קשוחה (V28) ---
+    # --- גיאומטריה (V29) ---
     min_prior_uptrend: float = 0.08    
     max_base_depth: float = 0.35       
-    max_tightness_depth: float = 0.05  # הידית חייבת להיות מכווצת לחלוטין (עד 5%)
-    min_breakout_close_strength: float = 0.40
+    max_tightness_depth: float = 0.08  # הוחזר ל-8% כי 5% היה חונק מדי
+    min_breakout_close_strength: float = 0.35
     min_rs_65: float = 0.04            
     max_dist_from_52w_high: float = 0.15
     
@@ -62,7 +62,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v28_sniper_consistency"
+    output_prefix: str = "canslim_v29_balanced_alpha"
 
 # ==========================================
 # 1. Data & Indicators
@@ -104,7 +104,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v28.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v29.pkl"
 
     if cache_file.exists():
         try:
@@ -268,10 +268,10 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         profit_high = (highest_seen - entry_price) / max(entry_price, 1e-9)
         
         new_stop = stop_today
-        # --- קיבוע רווחים אגרסיבי יותר (V28) ---
-        if profit_high >= 0.08: new_stop = max(new_stop, entry_price * 1.01) # מעט מעל הכניסה
-        if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.92) # אם עשתה 15%, נותנים רק 8% מרווח
-        if profit_high >= 0.25: new_stop = max(new_stop, highest_seen * 0.88) # טריילינג ארוך טווח לרווחים עצומים
+        # מערכת נועלת הרווחים המוכחת מהבקטסט הקודם
+        if profit_high >= 0.08: new_stop = max(new_stop, entry_price * 1.01) 
+        if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.92) # נועל 8% מתחת לשיא
+        if profit_high >= 0.25: new_stop = max(new_stop, highest_seen * 0.88) 
 
         stop_next_day = max(stop_today, new_stop)
 
@@ -303,7 +303,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, universe_df=None):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks with V28 Sniper Rules (VDU & Strong Volume)...")
+    print(f"\nScanning {len(tickers)} stocks with V29 Balanced Alpha Rules...")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -328,12 +328,8 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                     if len(pattern_data) < 250: continue
                     if not stock_filter_ok(today, cfg): continue
                     
-                    # חוק ייבוש מחזורים (VDU - Volume Dry Up)
-                    # המחזור ביום שלפני הפריצה חייב להיות קטן מהממוצע כדי להעיד על חוסר מוכרים!
-                    prev_vol = float(pattern_data.iloc[-1]["Volume"])
-                    prev_vol_50 = float(pattern_data.iloc[-1]["Vol_50"])
-                    if prev_vol > prev_vol_50: continue 
-                    
+                    # ביטול חוק הייבוש המוחלט. מניות מוסדיות יכולות לרכז נפח גם ביום שלפני.
+
                     spy_past = spy_df[spy_df.index <= current_date]
                     if not spy_past.empty:
                         spy_rs = float(spy_past.iloc[-1]["ROC_65"])
@@ -675,7 +671,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v28 - The Sniper Rules: VDU & Strict Risk)")
+    print("VCP BACKTEST REPORT (v29 - Balanced Alpha & Lock Profits)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
