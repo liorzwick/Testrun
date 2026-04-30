@@ -30,22 +30,19 @@ class BacktestConfig:
     slippage_bps: float = 12
     commission_bps: float = 2
     
-    # --- שביל הזהב: נותנים לבוט לנשום (V29) ---
-    breakout_volume_ratio: float = 1.25  # ירד מ-1.4 כדי להגדיל כמות עסקאות (עדיין 25% מעל הממוצע)
+    breakout_volume_ratio: float = 1.25  
     min_dollar_vol_50: float = 30_000_000 
     min_price: float = 15.0               
     
-    # ניהול זמן וסיכון
     min_risk_pct: float = 0.01         
-    max_risk_pct: float = 0.06         # טיפה יותר מרווח לסטופים כדי לא לפסול עסקאות טובות
+    max_risk_pct: float = 0.06         
     max_hold_bars: int = 150           
-    time_stop_bars: int = 18           # נותנים למניה קצת יותר משבועיים להוכיח את עצמה
+    time_stop_bars: int = 18           
     min_profit_after_time_stop: float = 0.015 
     
-    # --- גיאומטריה (V29) ---
     min_prior_uptrend: float = 0.08    
     max_base_depth: float = 0.35       
-    max_tightness_depth: float = 0.08  # הוחזר ל-8% כי 5% היה חונק מדי
+    max_tightness_depth: float = 0.08  
     min_breakout_close_strength: float = 0.35
     min_rs_65: float = 0.04            
     max_dist_from_52w_high: float = 0.15
@@ -62,7 +59,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v29_balanced_alpha"
+    output_prefix: str = "canslim_v30_scale_out"
 
 # ==========================================
 # 1. Data & Indicators
@@ -104,7 +101,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v29.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v30.pkl"
 
     if cache_file.exists():
         try:
@@ -220,7 +217,7 @@ def compute_signal_score(pattern_score: float, rs_65: float, volume_ratio: float
     return round(pattern_score + rs_component + vol_component + near_high_component + cs_component, 4)
 
 # ==========================================
-# 5. Patient Trade Simulation
+# 5. Patient Trade Simulation (Scale-Out V30)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -237,6 +234,9 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         
     highest_seen = float(entry_price)
     lowest_seen = float(entry_price)
+    
+    scaled_out = False
+    scale_out_price = 0.0
 
     for i, row in enumerate(future.itertuples()):
         dt = row.Index
@@ -247,19 +247,25 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 
         stop_today = initial_stop if i == 0 else stop_next_day
 
+        # פגיעה בסטופ (שוק הפתיחה)
         if day_open <= stop_today:
-            final_exit_price = day_open * (1 - cfg.slippage_bps / 10000)
-            gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
+            current_exit = day_open * (1 - cfg.slippage_bps / 10000)
+            blended_exit = ((scale_out_price + current_exit) / 2.0) if scaled_out else current_exit
+            gross_pct = (blended_exit - entry_price) / max(entry_price, 1e-9) * 100
             net_pct = gross_pct - (2 * cfg.commission_bps / 100)
-            return {"Exit_Date": dt, "Exit_Price": final_exit_price, "Exit_Reason": "GapStop", "Hold_Bars": i+1,
+            reason = "GapStop_Scaled" if scaled_out else "GapStop"
+            return {"Exit_Date": dt, "Exit_Price": blended_exit, "Exit_Reason": reason, "Hold_Bars": i+1,
                     "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
                     "MAE_Pct": round((min(lowest_seen, day_open)/max(entry_price, 1e-9)-1)*100, 2), "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)}
 
+        # פגיעה בסטופ (תוך יומי)
         if day_low <= stop_today:
-            final_exit_price = stop_today * (1 - cfg.slippage_bps / 10000)
-            gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
+            current_exit = stop_today * (1 - cfg.slippage_bps / 10000)
+            blended_exit = ((scale_out_price + current_exit) / 2.0) if scaled_out else current_exit
+            gross_pct = (blended_exit - entry_price) / max(entry_price, 1e-9) * 100
             net_pct = gross_pct - (2 * cfg.commission_bps / 100)
-            return {"Exit_Date": dt, "Exit_Price": final_exit_price, "Exit_Reason": "StopHit", "Hold_Bars": i+1,
+            reason = "StopHit_Scaled" if scaled_out else "StopHit"
+            return {"Exit_Date": dt, "Exit_Price": blended_exit, "Exit_Reason": reason, "Hold_Bars": i+1,
                     "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
                     "MAE_Pct": round((min(lowest_seen, day_low)/max(entry_price, 1e-9)-1)*100, 2), "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)}
 
@@ -268,33 +274,47 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         profit_high = (highest_seen - entry_price) / max(entry_price, 1e-9)
         
         new_stop = stop_today
-        # מערכת נועלת הרווחים המוכחת מהבקטסט הקודם
-        if profit_high >= 0.08: new_stop = max(new_stop, entry_price * 1.01) 
-        if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.92) # נועל 8% מתחת לשיא
+        
+        # --- SCALE OUT LOGIC (מימוש חלקי) ---
+        if not scaled_out and profit_high >= 0.10: # ברגע שיש 10% רווח
+            scaled_out = True
+            scale_out_price = entry_price * 1.10 # נועלים 50% מהכמות ברווח של 10%
+            new_stop = max(new_stop, entry_price * 1.005) # מקפיצים את הסטופ של ה-50% הנותרים לנקודת הכניסה!
+            
+        # הסטופ הנגרר הרגיל ממשיך לעבוד עבור החצי שנשאר
+        if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.92) 
         if profit_high >= 0.25: new_stop = max(new_stop, highest_seen * 0.88) 
 
         stop_next_day = max(stop_today, new_stop)
 
         if (i + 1) == cfg.early_exit_bars:
             if (day_close / max(entry_price, 1e-9)) - 1.0 < cfg.early_exit_min_progress:
-                final_exit_price = day_close * (1 - cfg.slippage_bps / 10000)
-                gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
-                return {"Exit_Date": dt, "Exit_Price": final_exit_price, "Exit_Reason": "EarlyFail", "Hold_Bars": i+1,
-                        "Pct_Change": round(gross_pct - (2 * cfg.commission_bps / 100), 2), "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
+                current_exit = day_close * (1 - cfg.slippage_bps / 10000)
+                blended_exit = ((scale_out_price + current_exit) / 2.0) if scaled_out else current_exit
+                gross_pct = (blended_exit - entry_price) / max(entry_price, 1e-9) * 100
+                net_pct = gross_pct - (2 * cfg.commission_bps / 100)
+                reason = "EarlyFail_Scaled" if scaled_out else "EarlyFail"
+                return {"Exit_Date": dt, "Exit_Price": blended_exit, "Exit_Reason": reason, "Hold_Bars": i+1,
+                        "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
                         "MAE_Pct": round((lowest_seen/max(entry_price, 1e-9)-1)*100, 2), "R_Multiple": 0.0}
 
         if (i + 1) >= cfg.time_stop_bars:
             if (day_close - entry_price) / max(entry_price, 1e-9) < cfg.min_profit_after_time_stop:
-                final_exit_price = day_close * (1 - cfg.slippage_bps / 10000)
-                gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
-                return {"Exit_Date": dt, "Exit_Price": final_exit_price, "Exit_Reason": "TimeExit", "Hold_Bars": i+1,
-                        "Pct_Change": round(gross_pct - (2 * cfg.commission_bps / 100), 2), "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
+                current_exit = day_close * (1 - cfg.slippage_bps / 10000)
+                blended_exit = ((scale_out_price + current_exit) / 2.0) if scaled_out else current_exit
+                gross_pct = (blended_exit - entry_price) / max(entry_price, 1e-9) * 100
+                net_pct = gross_pct - (2 * cfg.commission_bps / 100)
+                reason = "TimeExit_Scaled" if scaled_out else "TimeExit"
+                return {"Exit_Date": dt, "Exit_Price": blended_exit, "Exit_Reason": reason, "Hold_Bars": i+1,
+                        "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
                         "MAE_Pct": round((lowest_seen/max(entry_price, 1e-9)-1)*100, 2), "R_Multiple": 0.0}
 
-    final_exit_price = float(future.iloc[-1]["Close"]) * (1 - cfg.slippage_bps / 10000)
-    gross_pct = (final_exit_price - entry_price) / max(entry_price, 1e-9) * 100
+    current_exit = float(future.iloc[-1]["Close"]) * (1 - cfg.slippage_bps / 10000)
+    blended_exit = ((scale_out_price + current_exit) / 2.0) if scaled_out else current_exit
+    gross_pct = (blended_exit - entry_price) / max(entry_price, 1e-9) * 100
     net_pct = gross_pct - (2 * cfg.commission_bps / 100)
-    return {"Exit_Date": future.index[-1], "Exit_Price": final_exit_price, "Exit_Reason": "MaxHold", "Hold_Bars": len(future),
+    reason = "MaxHold_Scaled" if scaled_out else "MaxHold"
+    return {"Exit_Date": future.index[-1], "Exit_Price": blended_exit, "Exit_Reason": reason, "Hold_Bars": len(future),
             "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
             "MAE_Pct": round((lowest_seen/max(entry_price, 1e-9)-1)*100, 2), "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)}
 
@@ -303,7 +323,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, universe_df=None):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks with V29 Balanced Alpha Rules...")
+    print(f"\nScanning {len(tickers)} stocks with Scale-Out logic...")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -328,8 +348,6 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                     if len(pattern_data) < 250: continue
                     if not stock_filter_ok(today, cfg): continue
                     
-                    # ביטול חוק הייבוש המוחלט. מניות מוסדיות יכולות לרכז נפח גם ביום שלפני.
-
                     spy_past = spy_df[spy_df.index <= current_date]
                     if not spy_past.empty:
                         spy_rs = float(spy_past.iloc[-1]["ROC_65"])
@@ -671,7 +689,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v29 - Balanced Alpha & Lock Profits)")
+    print("VCP BACKTEST REPORT (v30 - SCALE OUT 50% @ +10%)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
