@@ -148,7 +148,10 @@ def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     for c in required:
         if pd.isna(today[c]).any() if isinstance(today[c], pd.Series) else pd.isna(today[c]): return False
     if float(today["Close"]) < cfg.min_price: return False
-    if not (float(today["Close"]) > float(today["SMA_21"]) > float(today["SMA_50"]) > float(today["SMA_150"]) > float(today["SMA_200"])): return False
+    
+    # 🚨 חוק מחייב: חייב להיות מעל ממוצע 50 בלבד כדי לאפשר תפיסת מניות מתחת ל-150 🚨
+    if not (float(today["Close"]) > float(today["SMA_50"])): return False
+    
     if float(today["DollarVol_50"]) < cfg.min_dollar_vol_50: return False
     if not (0.01 <= float(today["ATR_Pct"]) <= 0.08): return False
     dist_52w = (float(today["Close"]) / max(float(today["High_252"]), 1e-9)) - 1.0
@@ -165,7 +168,8 @@ def get_ascending_triangle_signal(pattern_data: pd.DataFrame, cfg: BacktestConfi
     highs = recent["High"].values
     lows = recent["Low"].values
 
-    slice1 = highs[:-10]
+    # 🚨 חוק ההתיישנות: צד שמאל של התבנית חייב להיות לפחות בן 21 יום
+    slice1 = highs[:-21]
     if len(slice1) == 0: return None
     peak1_pos = int(np.argmax(slice1))
     peak1_price = float(slice1[peak1_pos])
@@ -198,6 +202,7 @@ def get_ascending_triangle_signal(pattern_data: pd.DataFrame, cfg: BacktestConfi
     if valley2_price <= valley1_price * 1.015: return None
 
     tightness = (peak2_price - valley2_price) / max(peak2_price, 1e-9)
+    # נבדק בשלב הסינון הראשי אם זו מניה מתחת ל-150, כאן משתמשים במקסימום הרגיל
     if tightness > cfg.max_tightness_depth: return None
 
     pivot = max(peak1_price, peak2_price)
@@ -206,7 +211,7 @@ def get_ascending_triangle_signal(pattern_data: pd.DataFrame, cfg: BacktestConfi
         "pivot_price": pivot, "handle_low": valley1_price, "tight_low": valley2_price,
         "cup_depth_pct": base_depth, "handle_depth_pct": tightness,
         "cup_length": int(valley1_pos - peak1_pos), "handle_length": int(len(recent) - peak2_pos),
-        "prior_uptrend": 0.1, "tightness": tightness, "score": 1.0           
+        "prior_uptrend": 0.1, "tightness": tightness, "score": 1.0            
     }
 
 def compute_signal_score(pattern_score: float, rs_65: float, volume_ratio: float, dist_52w: float, close_strength: float) -> float:
@@ -247,7 +252,6 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 
         stop_today = initial_stop if i == 0 else stop_next_day
 
-        # פגיעה בסטופ (שוק הפתיחה)
         if day_open <= stop_today:
             current_exit = day_open * (1 - cfg.slippage_bps / 10000)
             blended_exit = ((scale_out_price + current_exit) / 2.0) if scaled_out else current_exit
@@ -258,7 +262,6 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
                     "Pct_Change": round(net_pct, 2), "MFE_Pct": round((highest_seen/max(entry_price, 1e-9)-1)*100, 2),
                     "MAE_Pct": round((min(lowest_seen, day_open)/max(entry_price, 1e-9)-1)*100, 2), "R_Multiple": round((entry_price * net_pct / 100) / max(entry_price - initial_stop, 1e-9), 2)}
 
-        # פגיעה בסטופ (תוך יומי)
         if day_low <= stop_today:
             current_exit = stop_today * (1 - cfg.slippage_bps / 10000)
             blended_exit = ((scale_out_price + current_exit) / 2.0) if scaled_out else current_exit
@@ -275,13 +278,12 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         
         new_stop = stop_today
         
-        # --- SCALE OUT LOGIC (מימוש חלקי) ---
-        if not scaled_out and profit_high >= 0.10: # ברגע שיש 10% רווח
+        # --- SCALE OUT LOGIC ---
+        if not scaled_out and profit_high >= 0.10: 
             scaled_out = True
-            scale_out_price = entry_price * 1.10 # נועלים 50% מהכמות ברווח של 10%
-            new_stop = max(new_stop, entry_price * 1.005) # מקפיצים את הסטופ של ה-50% הנותרים לנקודת הכניסה!
+            scale_out_price = entry_price * 1.10 
+            new_stop = max(new_stop, entry_price * 1.005) 
             
-        # הסטופ הנגרר הרגיל ממשיך לעבוד עבור החצי שנשאר
         if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.92) 
         if profit_high >= 0.25: new_stop = max(new_stop, highest_seen * 0.88) 
 
@@ -323,7 +325,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, universe_df=None):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks with Scale-Out logic...")
+    print(f"\nScanning {len(tickers)} stocks with Strict Under-150 Logic...")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -344,18 +346,32 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
 
                     pattern_data = past_data.iloc[:-1].copy()
                     today = past_data.iloc[-1]
+                    yesterday = past_data.iloc[-2]
 
                     if len(pattern_data) < 250: continue
                     if not stock_filter_ok(today, cfg): continue
                     
+                    # 🚨 בדיקה האם המניה מתחת ל-150
+                    is_below_150 = float(today["Close"]) < float(today["SMA_150"])
+                    
+                    # 🚨 תנאי קשוח 1: שיפוע ממוצע 50 עולה
+                    if is_below_150 and float(today["SMA_50"]) <= float(yesterday["SMA_50"]):
+                        continue
+
                     spy_past = spy_df[spy_df.index <= current_date]
                     if not spy_past.empty:
                         spy_rs = float(spy_past.iloc[-1]["ROC_65"])
                         stock_rs = float(today["ROC_65"])
-                        if (stock_rs - spy_rs) < cfg.min_rs_65: continue
+                        
+                        # 🚨 תנאי קשוח 2: עליונות יחסית כפולה
+                        required_rs = cfg.min_rs_65 * 2 if is_below_150 else cfg.min_rs_65
+                        if (stock_rs - spy_rs) < required_rs: continue
 
                     pattern = get_ascending_triangle_signal(pattern_data, cfg)
                     if pattern is None: continue
+                    
+                    # 🚨 תנאי קשוח 3: כיווץ אולטרה-הדוק (עד 5%) למניות מתחת ל-150
+                    if is_below_150 and pattern["tightness"] > 0.05: continue
 
                     pivot = pattern["pivot_price"]
                     prev_close = float(pattern_data.iloc[-1]["Close"])
@@ -365,12 +381,18 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
 
                     day_range = max(high_today - low_today, 1e-9)
                     close_strength = (close - low_today) / day_range
-                    if close_strength < cfg.min_breakout_close_strength: continue
-
+                    
                     vol_ratio = float(today["Volume"]) / max(float(today["Vol_50"]), 1e-9)
-                    if pd.isna(vol_ratio) or vol_ratio < cfg.breakout_volume_ratio: continue
-
+                    if pd.isna(vol_ratio): continue
+                    
                     if not (prev_close <= pivot and high_today > pivot and close > pivot and close <= pivot * (1 + cfg.max_pivot_extension)):
+                        continue
+
+                    # 🚨 תנאי קשוח 4: ווליום מפלצתי וסגירה חזקה אם מתחת ל-150
+                    req_vol = 1.5 if is_below_150 else cfg.breakout_volume_ratio
+                    req_close = 0.5 if is_below_150 else cfg.min_breakout_close_strength
+                    
+                    if close_strength < req_close or vol_ratio < req_vol:
                         continue
 
                     high_252 = float(today["High_252"])
@@ -418,7 +440,8 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                         "Close_Strength": round(close_strength, 4), "Gap_From_Pivot": round(gap_from_pivot, 4),
                         "Hold_Bars": sim["Hold_Bars"], "Result": classify_pnl(sim["Pct_Change"]),
                         "Exit_Reason": sim["Exit_Reason"], "MFE_Pct": sim["MFE_Pct"], "MAE_Pct": sim["MAE_Pct"],
-                        "R_Multiple": sim["R_Multiple"], "Signal_Score": total_score,
+                        "R_Multiple": sim["R_Multiple"], "Signal_Score": total_score, 
+                        "Is_Below_150": is_below_150 # שומר את המידע עבור הדו"חות!
                     })
             except Exception as e:
                 pass
@@ -689,7 +712,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame):
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v30 - SCALE OUT 50% @ +10%)")
+    print("VCP BACKTEST REPORT (v30 - STRICT UNDER 150 SMA)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
