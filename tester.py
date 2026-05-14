@@ -8,7 +8,6 @@ import warnings
 import time
 from tqdm import tqdm
 import os
-import json
 
 warnings.filterwarnings("ignore")
 
@@ -32,24 +31,22 @@ class BacktestConfig:
     slippage_bps: float = 12
     commission_bps: float = 2
     
-    # --- תואם במדויק לבוט החי ---
+    # מסנני שוק ופריצה
     breakout_volume_ratio: float = 1.30  
     min_dollar_vol_50: float = 15_000_000 
     min_price: float = 8.0               
-    min_rs_65: float = 0.05            
-    min_breakout_close_strength: float = 0.55
-    min_atr_pct: float = 0.02
-
-    # מרחקים משיא (משולב)
-    max_dist_from_52w_high_normal: float = 0.40
-    max_dist_from_52w_high_below_150: float = 0.45
     
-    # ניהול זמן וסיכון
+    # ניהול זמן וסיכון מותאם SCALE-OUT
     min_risk_pct: float = 0.01         
-    max_risk_pct: float = 0.10  # הותאם ל-10% לפי הבוט החי
+    max_risk_pct: float = 0.10         
     max_hold_bars: int = 150           
     time_stop_bars: int = 18           
     min_profit_after_time_stop: float = 0.015 
+    
+    # פרמטרי הבוט החי
+    min_rs_65: float = 0.05            
+    min_breakout_close_strength: float = 0.55
+    max_dist_from_52w_high: float = 0.40 # גמישות לשוק רחב
     
     max_pivot_extension: float = 0.04  
     max_entry_extension: float = 0.04  
@@ -61,6 +58,7 @@ class BacktestConfig:
     use_point_in_time_universe: bool = False
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
+    universe_file: str | None = None
     output_prefix: str = "canslim_v31_multi_pattern"
 
 # ==========================================
@@ -121,23 +119,8 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
             time.sleep(1.0)
     return pd.DataFrame()
 
-def load_tickers(cfg):
-    if os.path.exists(cfg.custom_tickers_file):
-        try:
-            df = pd.read_csv(cfg.custom_tickers_file)
-            col_name = next((c for c in df.columns if c.strip().lower() in ['ticker', 'symbol']), None)
-            if col_name:
-                tickers = df[col_name].dropna().astype(str).str.strip().str.upper().tolist()
-                tickers = [t.replace('.', '-') for t in tickers if t.isalpha() or '-' in t or '.' in t]
-                valid_tickers = sorted(list(set(tickers)))
-                print(f"✅ Loaded {len(valid_tickers)} tickers from {cfg.custom_tickers_file}")
-                return valid_tickers
-        except Exception as e:
-            print(f"❌ Error reading file: {e}")
-    return []
-
 # ==========================================
-# 3. Filters
+# 3. Universe & Filters
 # ==========================================
 def market_filter_ok(spy_df: pd.DataFrame, current_date: pd.Timestamp) -> bool:
     x = spy_df[spy_df.index <= current_date]
@@ -154,23 +137,14 @@ def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     if float(today["Close"]) < cfg.min_price: return False
     if float(today["DollarVol_50"]) < cfg.min_dollar_vol_50: return False
     if float(today["Close"]) <= float(today["SMA_50"]): return False
-    if float(today["ATR_Pct"]) < cfg.min_atr_pct: return False
     
-    is_below_150 = float(today["Close"]) < float(today["SMA_150"])
-    max_dist = cfg.max_dist_from_52w_high_below_150 if is_below_150 else cfg.max_dist_from_52w_high_normal
     dist_52w = (float(today["Close"]) / max(float(today["High_252"]), 1e-9)) - 1.0
-    
-    if dist_52w < -max_dist: return False
+    if dist_52w < -cfg.max_dist_from_52w_high: return False
     return True
 
 # ==========================================
-# 4. Pattern Detection (From Live Bot)
+# 4. Pattern Detection (The 4 Live Patterns)
 # ==========================================
-def calculate_dry_up(vols, base_start, base_end):
-    base_vol = np.mean(vols[base_start:base_end]) if base_end > base_start else 1
-    handle_vol = np.mean(vols[-5:])
-    return float(handle_vol / base_vol) if base_vol > 0 else 1.0
-
 def get_cup_and_handle(highs, lows, vols, closes, n):
     if n < 60: return None
     recent_highs = highs[:-20]
@@ -202,7 +176,7 @@ def get_cup_and_handle(highs, lows, vols, closes, n):
     if handle_depth > cup_depth * 0.5: return None 
     if handle_low < cup_low_val + (pivot - cup_low_val) * 0.4: return None 
 
-    return {"type": "Cup & Handle", "pivot_price": pivot, "tight_low": handle_low, "last_pullback_low": handle_low}
+    return {"type": "Cup & Handle", "pivot_price": pivot, "tight_low": handle_low, "base_depth": cup_depth, "tightness": handle_depth, "base_length": len(highs) - left_lip_idx}
 
 def get_bull_flag(highs, lows, vols, closes, n):
     if n < 40: return None
@@ -231,10 +205,7 @@ def get_bull_flag(highs, lows, vols, closes, n):
     max_in_flag = float(np.max(highs[absolute_peak_idx+1 : -1]))
     if max_in_flag > pole_peak_val * 1.01: return None 
 
-    current_close = float(closes[-1])
-    if current_close < flag_low + (pole_peak_val - flag_low) * 0.3: return None 
-
-    return {"type": "Bull Flag", "pivot_price": pole_peak_val, "tight_low": flag_low, "last_pullback_low": flag_low}
+    return {"type": "Bull Flag", "pivot_price": pole_peak_val, "tight_low": flag_low, "base_depth": flag_depth, "tightness": flag_depth, "base_length": flag_length}
 
 def get_darvas_box(highs, lows, vols, closes, n):
     box_length = 30 
@@ -257,13 +228,7 @@ def get_darvas_box(highs, lows, vols, closes, n):
     if len(top_touches) < 2: return None
     if top_touches[-1] - top_touches[0] < 12: return None 
 
-    pre_box_close = float(closes[-(box_length + 20)])
-    if pre_box_close >= box_bottom * 0.93: return None 
-
-    current_close = float(closes[-1])
-    if current_close < box_bottom + (box_top - box_bottom) * 0.75: return None 
-
-    return {"type": "Darvas Box", "pivot_price": box_top, "tight_low": box_bottom, "last_pullback_low": box_bottom}
+    return {"type": "Darvas Box", "pivot_price": box_top, "tight_low": box_bottom, "base_depth": box_depth, "tightness": box_depth, "base_length": box_length}
 
 def get_double_bottom(highs, lows, vols, n):
     if n < 100: return None
@@ -289,8 +254,9 @@ def get_double_bottom(highs, lows, vols, n):
 
     pivot = mid_peak_val
     handle_low = float(np.min(lows[right_bottom_idx:]))
+    handle_depth = (pivot - handle_low) / max(pivot, 1e-9)
 
-    return {"type": "Double Bottom", "pivot_price": pivot, "tight_low": handle_low, "last_pullback_low": handle_low}
+    return {"type": "Double Bottom", "pivot_price": pivot, "tight_low": handle_low, "base_depth": base_depth, "tightness": handle_depth, "base_length": right_bottom_idx - left_bottom_idx}
 
 def check_classical_patterns(hist):
     hist_filtered = hist.dropna(subset=['High', 'Low', 'Volume', 'Close'])
@@ -317,8 +283,13 @@ def check_classical_patterns(hist):
     return None
 
 # ==========================================
-# 5. Patient Trade Simulation (Scale-Out V30)
+# 5. Patient Trade Simulation (Scale-Out V30 Logic)
 # ==========================================
+def classify_pnl(pct: float) -> str:
+    if pct > 0: return "Win"
+    if pct < 0: return "Loss"
+    return "Flat"
+
 def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: float, initial_stop: float, cfg: BacktestConfig):
     future = df[df.index >= entry_date].head(cfg.max_hold_bars)
     if future.empty: return None
@@ -367,7 +338,6 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         profit_high = (highest_seen - entry_price) / max(entry_price, 1e-9)
         
         new_stop = stop_today
-        
         if not scaled_out and profit_high >= 0.10: 
             scaled_out = True
             scale_out_price = entry_price * 1.10 
@@ -412,9 +382,9 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 # 6. Candidate Generation
 # ==========================================
-def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
+def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, universe_df=None):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks with Multi-Pattern Logic...")
+    print(f"\nScanning {len(tickers)} stocks across ALL Classical Patterns...")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -427,6 +397,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
 
                 test_days = df[(df.index >= test_start) & (df.index <= test_end)].index
                 for current_date in test_days:
+                    if cfg.use_point_in_time_universe and not ticker_allowed_on_date(ticker, current_date, universe_df): continue
                     if not market_filter_ok(spy_df, current_date): continue
 
                     past_data = df[df.index <= current_date]
@@ -451,7 +422,6 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                     prev_close = float(yesterday["Close"])
                     close = float(today["Close"])
                     
-                    # פריצה חייבת לקרות היום
                     if not (prev_close <= pivot and close > pivot): continue
 
                     day_range = max(float(today["High"]) - float(today["Low"]), 1e-9)
@@ -474,7 +444,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                     if entry_price > pivot * (1 + cfg.max_entry_extension): continue
 
                     atr = float(today["ATR_14"])
-                    tight_low = min(float(pattern["tight_low"]), float(pattern["last_pullback_low"]))
+                    tight_low = float(pattern["tight_low"])
                     calculated_stop = tight_low - (0.5 * atr) 
                     max_allowed_stop = entry_price * (1 - cfg.max_risk_pct)
                     initial_stop = max(calculated_stop, max_allowed_stop)
@@ -490,30 +460,36 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                         "Signal_Date": current_date, "Entry_Date": entry_date, "Entry_Price": round(entry_price, 2),
                         "Exit_Date": sim["Exit_Date"], "Exit_Price": round(sim["Exit_Price"], 2), "Pct_Change": sim["Pct_Change"],
                         "Risk_Pct": round(risk_pct * 100, 2), "Stop_Price": round(initial_stop, 2),
-                        "Volume_Ratio": round(vol_ratio, 2), "Hold_Bars": sim["Hold_Bars"], 
-                        "Result": classify_pnl(sim["Pct_Change"]), "Exit_Reason": sim["Exit_Reason"], 
-                        "MFE_Pct": sim["MFE_Pct"], "MAE_Pct": sim["MAE_Pct"]
+                        "Base_Depth_Pct": round(pattern["base_depth"] * 100, 2), "Tightness_Pct": round(pattern["tightness"] * 100, 2),
+                        "Base_Length": int(pattern["base_length"]), 
+                        "Volume_Ratio": round(vol_ratio, 2), "RS_65": round(stock_rs, 4), 
+                        "Close_Strength": round(close_strength, 4), "Gap_From_Pivot": round(gap_from_pivot, 4),
+                        "Hold_Bars": sim["Hold_Bars"], "Result": classify_pnl(sim["Pct_Change"]),
+                        "Exit_Reason": sim["Exit_Reason"], "MFE_Pct": sim["MFE_Pct"], "MAE_Pct": sim["MAE_Pct"]
                     })
             except Exception as e:
                 pass
 
     if not candidates: return pd.DataFrame()
-    return pd.DataFrame(candidates).sort_values(["Entry_Date"]).reset_index(drop=True)
+    return pd.DataFrame(candidates).sort_values(["Entry_Date", "Volume_Ratio"], ascending=[True, False]).reset_index(drop=True)
 
 # ==========================================
 # 7. Portfolio Management
 # ==========================================
+def get_close_on_or_before(df: pd.DataFrame, dt: pd.Timestamp, fallback: float) -> float:
+    x = df[df.index <= dt]
+    return float(x.iloc[-1]["Close"]) if not x.empty else fallback
+
 def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dict, cfg: BacktestConfig) -> pd.DataFrame:
     if candidates.empty: return pd.DataFrame()
 
-    def get_close_on_or_before(df: pd.DataFrame, dt: pd.Timestamp, fallback: float) -> float:
-        x = df[df.index <= dt]
-        return float(x.iloc[-1]["Close"]) if not x.empty else fallback
-
     cash = cfg.initial_capital
-    active, accepted, last_exit_by_ticker = [], [], {}
+    active = []
+    accepted = []
+    last_exit_by_ticker = {}
 
-    for cand in candidates.to_dict("records"):
+    cand_records = candidates.to_dict("records")
+    for cand in cand_records:
         entry_date = pd.Timestamp(cand["Entry_Date"])
         ticker = str(cand["Ticker"])
 
@@ -523,7 +499,8 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
         release, still_active = [], []
         for pos in active:
             exit_dt = pd.Timestamp(pos["Exit_Date"])
-            if exit_dt < entry_date:
+            closed = (exit_dt < entry_date or (cfg.allow_same_day_cash_reuse and exit_dt == entry_date))
+            if closed:
                 release.append(pos)
             else:
                 still_active.append(pos)
@@ -535,13 +512,20 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
         if any(pos["Ticker"] == ticker for pos in active): continue
         if len(active) >= cfg.max_positions: continue
 
-        equity = cash + sum(get_close_on_or_before(data_cache[p["Ticker"]], entry_date, p["Entry_Price"]) * p["Shares"] for p in active)
+        equity = cash + sum(
+            get_close_on_or_before(data_cache[p["Ticker"]], entry_date, p["Entry_Price"]) * p["Shares"]
+            for p in active
+        )
 
-        entry_price, stop_price, exit_price = float(cand["Entry_Price"]), float(cand["Stop_Price"]), float(cand["Exit_Price"])
+        entry_price = float(cand["Entry_Price"])
+        stop_price = float(cand["Stop_Price"])
+        exit_price = float(cand["Exit_Price"])
+
         risk_per_share = max(entry_price - stop_price, 1e-9)
         max_risk_dollars_trade = equity * cfg.risk_per_trade
         current_heat = sum(float(pos.get("Risk_Dollars", 0.0)) for pos in active)
-        remaining_heat = max(0.0, (equity * cfg.max_portfolio_heat) - current_heat)
+        max_heat = equity * cfg.max_portfolio_heat
+        remaining_heat = max(0.0, max_heat - current_heat)
 
         if remaining_heat <= 0: continue
 
@@ -558,19 +542,175 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
         if total_cost > cash: continue
 
         cash -= total_cost
+
         t = cand.copy()
-        t.update({"Shares": shares, "Entry_Fee": round(entry_fee, 2), "Exit_Fee": round(exit_fee, 2),
-                  "Net_PnL": round((shares * (exit_price - entry_price)) - entry_fee - exit_fee, 2)})
+        t["Shares"] = shares
+        t["Entry_Fee"] = round(entry_fee, 2)
+        t["Exit_Fee"] = round(exit_fee, 2)
+        t["Gross_Entry"] = round(shares * entry_price, 2)
+        t["Gross_Exit"] = round(shares * exit_price, 2)
+        t["Net_PnL"] = round((shares * (exit_price - entry_price)) - entry_fee - exit_fee, 2)
+        t["Alloc_Pct"] = round(shares * entry_price / max(equity, 1e-9) * 100, 2) if equity > 0 else 0.0
+        t["Risk_Dollars"] = round(shares * risk_per_share, 2)
         
         accepted.append(t)
         last_exit_by_ticker[ticker] = pd.Timestamp(t["Exit_Date"])
-        active.append({"Ticker": ticker, "Entry_Date": t["Entry_Date"], "Exit_Date": t["Exit_Date"],
-                       "Entry_Price": entry_price, "Exit_Price": exit_price, "Shares": shares, "Risk_Dollars": shares * risk_per_share})
+        active.append({
+            "Ticker": ticker, "Entry_Date": t["Entry_Date"], "Exit_Date": t["Exit_Date"],
+            "Entry_Price": entry_price, "Exit_Price": exit_price, "Shares": shares, "Exit_Fee": exit_fee,
+            "Risk_Dollars": t["Risk_Dollars"],
+        })
 
+    if not accepted: return pd.DataFrame()
     return pd.DataFrame(accepted).sort_values(["Entry_Date", "Exit_Date", "Ticker"]).reset_index(drop=True)
 
 # ==========================================
-# 8. Evaluation & Output
+# 8. Daily Equity Curve
+# ==========================================
+def build_daily_equity_curve(accepted_df: pd.DataFrame, data_cache: dict, benchmark_df: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
+    if accepted_df.empty:
+        return pd.DataFrame(columns=["Date", "Cash", "Market_Value", "Equity", "Drawdown_Pct", "Open_Positions"])
+
+    start_dt = pd.Timestamp(f"{cfg.start_year}-01-01")
+    end_dt = pd.Timestamp(f"{cfg.end_year}-12-31")
+
+    accepted_records = accepted_df.to_dict("records")
+    trade_dates = [pd.Timestamp(r["Entry_Date"]) for r in accepted_records] + [pd.Timestamp(r["Exit_Date"]) for r in accepted_records]
+    base_calendar = benchmark_df.index
+    full_calendar = base_calendar.union(pd.DatetimeIndex(trade_dates)).drop_duplicates().sort_values()
+    calendar = full_calendar[(full_calendar >= start_dt) & (full_calendar <= end_dt)]
+
+    entries_by_date, exits_by_date = {}, {}
+    for r in accepted_records:
+        entries_by_date.setdefault(pd.Timestamp(r["Entry_Date"]), []).append(r)
+        exits_by_date.setdefault(pd.Timestamp(r["Exit_Date"]), []).append(r)
+
+    cash = cfg.initial_capital
+    open_pos, rows = {}, []
+    running_peak = cfg.initial_capital
+
+    for dt in calendar:
+        if cfg.allow_same_day_cash_reuse:
+            for r in exits_by_date.get(dt, []):
+                key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
+                if key in open_pos:
+                    cash += float(r["Gross_Exit"]) - float(r["Exit_Fee"])
+                    del open_pos[key]
+            for r in entries_by_date.get(dt, []):
+                key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
+                open_pos[key] = r
+                cash -= float(r["Gross_Entry"]) + float(r["Entry_Fee"])
+        else:
+            for r in entries_by_date.get(dt, []):
+                key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
+                open_pos[key] = r
+                cash -= float(r["Gross_Entry"]) + float(r["Entry_Fee"])
+            for r in exits_by_date.get(dt, []):
+                key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
+                if key in open_pos:
+                    cash += float(r["Gross_Exit"]) - float(r["Exit_Fee"])
+                    del open_pos[key]
+
+        market_value = sum(
+            get_close_on_or_before(data_cache[pos["Ticker"]], dt, float(pos["Entry_Price"])) * float(pos["Shares"])
+            for pos in open_pos.values()
+        )
+        equity = cash + market_value
+        running_peak = max(running_peak, equity)
+        dd = (equity / running_peak - 1.0) * 100 if running_peak > 0 else 0.0
+
+        rows.append({
+            "Date": dt, "Cash": round(cash, 2), "Market_Value": round(market_value, 2),
+            "Equity": round(equity, 2), "Drawdown_Pct": round(dd, 2), "Positions": len(open_pos),
+        })
+
+    return pd.DataFrame(rows)
+
+# ==========================================
+# 9. Summaries
+# ==========================================
+def calc_drawdown(equity_curve: pd.Series) -> float:
+    if len(equity_curve) == 0: return 0.0
+    dd = (equity_curve / equity_curve.cummax()) - 1.0
+    return round(dd.min() * 100, 2)
+
+def summarize_trades(trades_df: pd.DataFrame, equity_df: pd.DataFrame | None = None) -> dict:
+    empty = {
+        "Trades": 0, "Wins": 0, "Losses": 0, "Win_Rate_Pct": 0.0, 
+        "Avg_Trade_Pct": 0.0, "Avg_Win_Pct": 0.0, "Avg_Loss_Pct": 0.0,
+        "Total_Return_Pct": 0.0, "Max_Drawdown_Pct": 0.0, "Net_PnL": 0.0
+    }
+    if trades_df.empty: return empty
+
+    wins = trades_df[trades_df["Pct_Change"] > 0]
+    losses = trades_df[trades_df["Pct_Change"] < 0]
+
+    total_return, max_dd = 0.0, 0.0
+    if equity_df is not None and not equity_df.empty:
+        total_return = round((equity_df["Equity"].iloc[-1] / max(equity_df["Equity"].iloc[0], 1e-9) - 1.0) * 100, 2)
+        max_dd = calc_drawdown(equity_df["Equity"])
+
+    return {
+        "Trades": len(trades_df), "Wins": len(wins), "Losses": len(losses),
+        "Win_Rate_Pct": round(len(wins) / len(trades_df) * 100, 2) if len(trades_df) > 0 else 0.0,
+        "Avg_Trade_Pct": round(trades_df["Pct_Change"].mean(), 2),
+        "Avg_Win_Pct": round(wins["Pct_Change"].mean(), 2) if len(wins) > 0 else 0.0,
+        "Avg_Loss_Pct": round(losses["Pct_Change"].mean(), 2) if len(losses) > 0 else 0.0,
+        "Total_Return_Pct": total_return, "Max_Drawdown_Pct": max_dd,
+        "Net_PnL": round(trades_df["Net_PnL"].sum(), 2) if "Net_PnL" in trades_df.columns else 0.0,
+    }
+
+def yearly_summary(accepted_df: pd.DataFrame, equity_df: pd.DataFrame) -> pd.DataFrame:
+    if accepted_df.empty: return pd.DataFrame()
+    tmp = accepted_df.copy()
+    tmp["Entry_Date"] = pd.to_datetime(tmp["Entry_Date"])
+    tmp["Year"] = tmp["Entry_Date"].dt.year
+    rows = []
+    for year, g in tmp.groupby("Year"):
+        eq = equity_df[equity_df["Date"].dt.year == year] if not equity_df.empty else pd.DataFrame()
+        s = summarize_trades(g, eq)
+        s["Year"] = year
+        rows.append(s)
+    return pd.DataFrame(rows).sort_values("Year").reset_index(drop=True)
+
+def monthly_summary(accepted_df: pd.DataFrame) -> pd.DataFrame:
+    if accepted_df.empty: return pd.DataFrame()
+    tmp = accepted_df.copy()
+    tmp["Entry_Date"] = pd.to_datetime(tmp["Entry_Date"])
+    tmp["Month"] = tmp["Entry_Date"].dt.to_period("M").astype(str)
+    return (
+        tmp.groupby("Month")
+        .agg(
+            Trades=("Ticker", "count"),
+            Win_Rate_Pct=("Pct_Change", lambda s: round(s.gt(0).sum() / len(s) * 100, 2) if len(s) > 0 else 0),
+            Avg_Trade_Pct=("Pct_Change", lambda s: round(s.mean(), 2)),
+            Net_PnL=("Net_PnL", "sum"),
+        )
+        .reset_index()
+    )
+
+# ==========================================
+# 10. Orchestrator
+# ==========================================
+def run_backtest_engine(tickers, cfg):
+    spy = get_data(cfg.benchmark, "2014-01-01", "2026-03-01", cfg)
+    data_cache = {cfg.benchmark: spy}
+    
+    for t in tqdm(tickers, desc="Loading Data"):
+        data_cache[t] = get_data(t, "2014-01-01", "2026-03-01", cfg)
+        
+    cands = generate_candidate_trades(tickers, data_cache, spy, cfg)
+    acc = accept_trades_with_portfolio_rules(cands, data_cache, cfg)
+    eq = build_daily_equity_curve(acc, data_cache, spy, cfg)
+    
+    yearly_df = yearly_summary(acc, eq)
+    monthly_df = monthly_summary(acc)
+    overall = summarize_trades(acc, eq)
+    
+    return cands, acc, eq, yearly_df, monthly_df, overall
+
+# ==========================================
+# 11. Output Helpers (Multi Pattern Analysis Added)
 # ==========================================
 def calculate_pattern_success(accepted_df: pd.DataFrame):
     if accepted_df.empty: return pd.DataFrame()
@@ -582,24 +722,41 @@ def calculate_pattern_success(accepted_df: pd.DataFrame):
     ).reset_index().sort_values("Avg_Trade", ascending=False)
     return stats
 
-def summarize_trades(trades_df: pd.DataFrame) -> dict:
-    if trades_df.empty: return {"Trades": 0}
-    wins = trades_df[trades_df["Pct_Change"] > 0]
-    return {
-        "Trades": len(trades_df), 
-        "Win_Rate_Pct": round(len(wins) / len(trades_df) * 100, 2),
-        "Avg_Trade_Pct": round(trades_df["Pct_Change"].mean(), 2),
-        "Net_PnL": round(trades_df["Net_PnL"].sum(), 2)
-    }
+def save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, overall, cfg: BacktestConfig):
+    out_dir = Path("output") / cfg.output_prefix
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-def print_final_report(overall: dict, accepted_df: pd.DataFrame):
+    candidates_df.to_csv(out_dir / "candidate_signals.csv", index=False, encoding="utf-8-sig")
+    accepted_df.to_csv(out_dir / "accepted_trades.csv", index=False, encoding="utf-8-sig")
+    equity_df.to_csv(out_dir / "equity_curve.csv", index=False, encoding="utf-8-sig")
+    yearly_df.to_csv(out_dir / "yearly_summary.csv", index=False, encoding="utf-8-sig")
+    monthly_df.to_csv(out_dir / "monthly_summary.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame([overall]).to_csv(out_dir / "overall_summary.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame([asdict(cfg)]).to_csv(out_dir / "config.csv", index=False, encoding="utf-8-sig")
+    
+    # Save the special pattern analysis!
+    pattern_stats = calculate_pattern_success(accepted_df)
+    if not pattern_stats.empty:
+        pattern_stats.to_csv(out_dir / "pattern_performance.csv", index=False, encoding="utf-8-sig")
+        
+    print(f"\nFiles saved -> {out_dir}/")
+
+def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.DataFrame):
+    if not overall or overall.get('Trades', 0) == 0:
+        print("No trades executed.")
+        return
     print("\n" + "=" * 80)
-    print("MULTI-PATTERN VCP BACKTEST REPORT (v31)")
+    print("VCP BACKTEST REPORT (v31 - Multi-Pattern & Scale Out)")
     print("=" * 80)
-    print(f" Total Trades  : {overall.get('Trades', 0)}")
-    print(f" Win Rate      : {overall.get('Win_Rate_Pct', 0.0)}%")
-    print(f" Avg Trade     : {overall.get('Avg_Trade_Pct', 0.0)}%")
-    print(f" Net PnL       : ${overall.get('Net_PnL', 0.0):,.0f}")
+    for _, r in yearly_df.iterrows():
+        print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
+    print("-" * 80)
+    print(f" Total Trades  : {overall['Trades']}")
+    print(f" Win Rate      : {overall['Win_Rate_Pct']}%")
+    print(f" Avg Trade     : {overall['Avg_Trade_Pct']}%")
+    print(f" Total Return  : {overall['Total_Return_Pct']}%")
+    print(f" Max Drawdown  : {overall['Max_Drawdown_Pct']}%")
+    print(f" Net PnL       : ${overall.get('Net_PnL', 0):,.0f}")
     
     print("\n--- PERFORMANCE BY PATTERN TYPE ---")
     stats = calculate_pattern_success(accepted_df)
@@ -607,17 +764,33 @@ def print_final_report(overall: dict, accepted_df: pd.DataFrame):
         print(stats.to_string(index=False))
     print("=" * 80)
 
+# ==========================================
+# 12. Utilities
+# ==========================================
+def get_tickers(cfg: BacktestConfig):
+    if cfg.custom_tickers_file and os.path.exists(cfg.custom_tickers_file):
+        try:
+            df = pd.read_csv(cfg.custom_tickers_file)
+            col_name = next((c for c in df.columns if c.strip().lower() in ['ticker', 'symbol']), None)
+            if col_name:
+                tickers = df[col_name].dropna().astype(str).str.strip().str.upper().tolist()
+                tickers = [t.replace('.', '-') for t in tickers if t.isalpha() or '-' in t or '.' in t]
+                valid_tickers = sorted(list(set(tickers)))
+                print(f"✅ Loaded {len(valid_tickers)} custom tickers from {cfg.custom_tickers_file}")
+                return valid_tickers
+            else:
+                raise ValueError(f"Could not find 'Ticker' column in {cfg.custom_tickers_file}.")
+        except Exception as e:
+            raise RuntimeError(f"Error loading custom file: {e}")
+    else:
+        raise FileNotFoundError(f"Custom file '{cfg.custom_tickers_file}' not found.")
+
+# ==========================================
+# 13. Main
+# ==========================================
 if __name__ == "__main__":
     cfg = BacktestConfig()
-    tickers = load_tickers(cfg)
-    
-    spy = get_data(cfg.benchmark, "2014-01-01", "2026-03-01", cfg)
-    data_cache = {cfg.benchmark: spy}
-    for t in tqdm(tickers, desc="Loading Data"):
-        data_cache[t] = get_data(t, "2014-01-01", "2026-03-01", cfg)
-        
-    cands = generate_candidate_trades(tickers, data_cache, spy, cfg)
-    acc = accept_trades_with_portfolio_rules(cands, data_cache, cfg)
-    overall = summarize_trades(acc)
-    
-    print_final_report(overall, acc)
+    tickers = get_tickers(cfg)
+    cands, acc, eq, yearly, monthly, overall = run_backtest_engine(tickers, cfg)
+    save_outputs(cands, acc, eq, yearly, monthly, overall, cfg)
+    print_final_report(overall, yearly, acc)
