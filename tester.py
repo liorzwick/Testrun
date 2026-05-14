@@ -8,6 +8,7 @@ import warnings
 import time
 from tqdm import tqdm
 import os
+import json
 
 warnings.filterwarnings("ignore")
 
@@ -31,22 +32,19 @@ class BacktestConfig:
     slippage_bps: float = 12
     commission_bps: float = 2
     
-    # מסנני שוק ופריצה
     breakout_volume_ratio: float = 1.30  
     min_dollar_vol_50: float = 15_000_000 
     min_price: float = 8.0               
     
-    # ניהול זמן וסיכון מותאם SCALE-OUT
     min_risk_pct: float = 0.01         
     max_risk_pct: float = 0.10         
     max_hold_bars: int = 150           
     time_stop_bars: int = 18           
     min_profit_after_time_stop: float = 0.015 
     
-    # פרמטרי הבוט החי
     min_rs_65: float = 0.05            
     min_breakout_close_strength: float = 0.55
-    max_dist_from_52w_high: float = 0.40 # גמישות לשוק רחב
+    max_dist_from_52w_high: float = 0.40 
     
     max_pivot_extension: float = 0.04  
     max_entry_extension: float = 0.04  
@@ -143,7 +141,7 @@ def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     return True
 
 # ==========================================
-# 4. Pattern Detection (The 4 Live Patterns)
+# 4. Pattern Detection (Multi Pattern)
 # ==========================================
 def get_cup_and_handle(highs, lows, vols, closes, n):
     if n < 60: return None
@@ -237,6 +235,7 @@ def get_double_bottom(highs, lows, vols, n):
     left_bottom_idx = int(np.argmin(recent_lows))
     left_bottom_val = float(recent_lows[left_bottom_idx])
 
+    # השיא שבין שני השפלים - זוהי נקודת הפיבוט הבלעדית!
     mid_section = highs[left_bottom_idx : -5]
     if len(mid_section) < 10: return None
     mid_peak_idx = left_bottom_idx + int(np.argmax(mid_section))
@@ -252,11 +251,12 @@ def get_double_bottom(highs, lows, vols, n):
     base_depth = (mid_peak_val - min(left_bottom_val, right_bottom_val)) / max(mid_peak_val, 1e-9)
     if base_depth < 0.10 or base_depth > 0.40: return None 
 
+    # הפיבוט הוא אך ורק נקודת האמצע. אין ידית בדאבל בוטום קלאסי!
     pivot = mid_peak_val
-    handle_low = float(np.min(lows[right_bottom_idx:]))
-    handle_depth = (pivot - handle_low) / max(pivot, 1e-9)
+    tight_low = float(np.min(lows[right_bottom_idx:]))
+    tightness = (pivot - tight_low) / max(pivot, 1e-9)
 
-    return {"type": "Double Bottom", "pivot_price": pivot, "tight_low": handle_low, "base_depth": base_depth, "tightness": handle_depth, "base_length": right_bottom_idx - left_bottom_idx}
+    return {"type": "Double Bottom", "pivot_price": pivot, "tight_low": tight_low, "base_depth": base_depth, "tightness": tightness, "base_length": right_bottom_idx - left_bottom_idx}
 
 def check_classical_patterns(hist):
     hist_filtered = hist.dropna(subset=['High', 'Low', 'Volume', 'Close'])
@@ -283,7 +283,7 @@ def check_classical_patterns(hist):
     return None
 
 # ==========================================
-# 5. Patient Trade Simulation (Scale-Out V30 Logic)
+# 5. Patient Trade Simulation (Scale-Out V30)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -382,7 +382,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 # 6. Candidate Generation
 # ==========================================
-def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, universe_df=None):
+def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
     print(f"\nScanning {len(tickers)} stocks across ALL Classical Patterns...")
 
@@ -397,7 +397,6 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
 
                 test_days = df[(df.index >= test_start) & (df.index <= test_end)].index
                 for current_date in test_days:
-                    if cfg.use_point_in_time_universe and not ticker_allowed_on_date(ticker, current_date, universe_df): continue
                     if not market_filter_ok(spy_df, current_date): continue
 
                     past_data = df[df.index <= current_date]
@@ -422,6 +421,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig, 
                     prev_close = float(yesterday["Close"])
                     close = float(today["Close"])
                     
+                    # הפריצה עצמה: מחיר חייב לעבור את הפיבוט בדיוק היום
                     if not (prev_close <= pivot and close > pivot): continue
 
                     day_range = max(float(today["High"]) - float(today["Low"]), 1e-9)
@@ -710,7 +710,7 @@ def run_backtest_engine(tickers, cfg):
     return cands, acc, eq, yearly_df, monthly_df, overall
 
 # ==========================================
-# 11. Output Helpers (Multi Pattern Analysis Added)
+# 11. Output & Case Studies Report
 # ==========================================
 def calculate_pattern_success(accepted_df: pd.DataFrame):
     if accepted_df.empty: return pd.DataFrame()
@@ -734,7 +734,6 @@ def save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, o
     pd.DataFrame([overall]).to_csv(out_dir / "overall_summary.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame([asdict(cfg)]).to_csv(out_dir / "config.csv", index=False, encoding="utf-8-sig")
     
-    # Save the special pattern analysis!
     pattern_stats = calculate_pattern_success(accepted_df)
     if not pattern_stats.empty:
         pattern_stats.to_csv(out_dir / "pattern_performance.csv", index=False, encoding="utf-8-sig")
@@ -763,6 +762,32 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
     if not stats.empty:
         print(stats.to_string(index=False))
     print("=" * 80)
+
+    # --- יצירת ה-Case Studies (הדוגמאות) ---
+    print("\n--- 📖 CASE STUDIES: עסקאות מופת לפי תבנית ---")
+    if not accepted_df.empty:
+        for pattern in accepted_df['Pattern_Type'].unique():
+            pattern_df = accepted_df[accepted_df['Pattern_Type'] == pattern]
+            if pattern_df.empty: continue
+            
+            # שליפת העסקה הכי רווחית לכל תבנית
+            best_trade = pattern_df.sort_values(by='Pct_Change', ascending=False).iloc[0]
+            
+            entry_date = best_trade['Entry_Date'].strftime('%Y-%m-%d')
+            exit_date = best_trade['Exit_Date'].strftime('%Y-%m-%d')
+            
+            print(f"\n🔥 תבנית: {pattern}")
+            print(f"📌 מניה: {best_trade['Ticker']} | כניסה: {entry_date} | יציאה: {exit_date}")
+            print(f"💰 רווח שמומש: {best_trade['Pct_Change']}% (רווח שיא MFE: {best_trade['MFE_Pct']}%)")
+            print(f"🚪 סיבת יציאה: {best_trade['Exit_Reason']}")
+            print("💡 למה הבוט נכנס? (נתוני הפריצה):")
+            print(f"   - פיצוץ ווליום מוסדי: פי {best_trade['Volume_Ratio']} ממוצע 50 יום")
+            print(f"   - כיווץ (Tightness): {best_trade['Tightness_Pct']}%")
+            print(f"   - עומק הבסיס: {best_trade['Base_Depth_Pct']}%")
+            print(f"   - אורך התבנית: {best_trade['Base_Length']} ימים")
+            print(f"   - חוזק סגירה יומית: {best_trade['Close_Strength']}")
+            print(f"   - עוצמה יחסית (RS): {best_trade['RS_65']}")
+            print("-" * 60)
 
 # ==========================================
 # 12. Utilities
