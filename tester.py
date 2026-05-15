@@ -57,7 +57,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v32_let_it_ride"
+    output_prefix: str = "canslim_v34_flag_channel_breakout"
 
 # ==========================================
 # 2. Data & Indicators
@@ -99,7 +99,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v32.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v34.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -178,32 +178,45 @@ def get_cup_and_handle(highs, lows, vols, closes, n):
 
 def get_bull_flag(highs, lows, vols, closes, n):
     if n < 40: return None
-    search_window = highs[-90:-4] 
+    search_window = highs[-40:-3] 
     if len(search_window) == 0: return None
 
     pole_peak_idx_local = int(np.argmax(search_window))
-    absolute_peak_idx = (n - 90) + pole_peak_idx_local
+    absolute_peak_idx = (n - 40) + pole_peak_idx_local
     pole_peak_val = float(highs[absolute_peak_idx])
 
-    start_search_idx = max(0, absolute_peak_idx - 40)
+    start_search_idx = max(0, absolute_peak_idx - 20)
     pole_start_val = float(np.min(lows[start_search_idx : absolute_peak_idx]))
 
-    if (pole_peak_val - pole_start_val) / max(pole_start_val, 1e-9) < 0.18: return None 
+    pole_height = (pole_peak_val - pole_start_val) / max(pole_start_val, 1e-9)
+    if pole_height < 0.25: return None 
 
     flag_length = (n - 1) - absolute_peak_idx
-    if flag_length < 4 or flag_length > 45: return None 
+    if flag_length < 3 or flag_length > 21: return None 
 
     flag_lows = lows[absolute_peak_idx : -1]
     if len(flag_lows) == 0: return None
     flag_low = float(np.min(flag_lows))
 
     flag_depth = (pole_peak_val - flag_low) / max(pole_peak_val, 1e-9)
-    if flag_depth < 0.03 or flag_depth > 0.20: return None 
+    if flag_depth < 0.02 or flag_depth > 0.15: return None 
+
+    if flag_low < pole_start_val + (pole_peak_val - pole_start_val) * 0.5: return None
 
     max_in_flag = float(np.max(highs[absolute_peak_idx+1 : -1]))
     if max_in_flag > pole_peak_val * 1.01: return None 
 
-    return {"type": "Bull Flag", "pivot_price": pole_peak_val, "tight_low": flag_low, "base_depth": flag_depth, "tightness": flag_depth, "base_length": flag_length}
+    # <<< התיקון הקריטי מבוסס קו מגמה יורד (Descending Channel) >>>
+    # במקום ששיא התורן יהיה הפיבוט, הפיבוט הוא השיא של ההתכנסות בימים האחרונים של הדגל.
+    # זה מדמה קנייה מדויקת בפריצה של התעלה היורדת!
+    local_resistance_start = max(absolute_peak_idx + 1, n - 5)
+    if local_resistance_start >= n - 1:
+        local_resistance_start = absolute_peak_idx + 1
+        
+    local_flag_high = float(np.max(highs[local_resistance_start : -1]))
+    pivot = local_flag_high
+
+    return {"type": "Bull Flag", "pivot_price": pivot, "tight_low": flag_low, "base_depth": flag_depth, "tightness": flag_depth, "base_length": flag_length}
 
 def get_darvas_box(highs, lows, vols, closes, n):
     box_length = 30 
@@ -298,7 +311,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
     
     scaled_out = False
     scale_out_price = 0.0
-    scale_out_pct = 0.33 # מוכרים רק 33% ברווח במקום 50%
+    scale_out_pct = 0.33 
 
     for i, row in enumerate(future.itertuples()):
         dt = row.Index
@@ -335,19 +348,16 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         
         new_stop = stop_today
         
-        # 1. ב-10% רווח: לא מוכרים! רק מזיזים סטופ לכניסה כדי להגן על העסקה.
         if profit_high >= 0.10: 
             new_stop = max(new_stop, entry_price * 1.01) 
             
-        # 2. מימוש חלקי (שליש כמות בלבד) נדחה ל-20% רווח!
         if not scaled_out and profit_high >= 0.20: 
             scaled_out = True
             scale_out_price = entry_price * 1.20 
-            new_stop = max(new_stop, entry_price * 1.05) # הבטחת מינימום 5% לחלק הנותר
+            new_stop = max(new_stop, entry_price * 1.05) 
             
-        # 3. טריילינג סטופ הדוק יותר: שומרים קרוב לשיא
-        if profit_high >= 0.20: new_stop = max(new_stop, highest_seen * 0.90) # 10% מתחת לשיא
-        if profit_high >= 0.40: new_stop = max(new_stop, highest_seen * 0.88) # נותנים למפלצות טיפה חמצן
+        if profit_high >= 0.20: new_stop = max(new_stop, highest_seen * 0.90) 
+        if profit_high >= 0.40: new_stop = max(new_stop, highest_seen * 0.88) 
 
         stop_next_day = max(stop_today, new_stop)
 
@@ -387,7 +397,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks with 'Let it Ride' Trade Management...")
+    print(f"\nScanning {len(tickers)} stocks... (Fixed Bull Flag Pivot)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -747,7 +757,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v32 - 'Let it Ride' Trade Management)")
+    print("VCP BACKTEST REPORT (v34 - Flag Channel Breakout)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
