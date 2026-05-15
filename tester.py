@@ -21,14 +21,15 @@ class BacktestConfig:
     end_year: int = 2025
     benchmark: str = "SPY"
     initial_capital: float = 100_000.0
-    risk_per_trade: float = 0.005      
+    
+    # --- מערכת הקצאת הון אגרסיבית (V35) ---
+    risk_per_trade: float = 0.0125     # סיכון של 1.25% מהתיק על כל טרייד (במקום 0.5%)
+    max_alloc_pct: float = 0.25        # מאפשר קניית מניה עד 25% משווי התיק (במקום 12%)
+    max_portfolio_heat: float = 0.08   # מאפשר חשיפת סיכון כוללת של 8% על כל התיק
+    cooldown_days: int = 3             # כניסה מחדש מותרת תוך 3 ימים (במקום 15)
     
     custom_tickers_file: str = "mystock.csv" 
-    
-    max_alloc_pct: float = 0.12        
     max_positions: int = 10            
-    max_portfolio_heat: float = 0.04   
-    cooldown_days: int = 15
     slippage_bps: float = 12
     commission_bps: float = 2
     
@@ -57,7 +58,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v34_flag_channel_breakout"
+    output_prefix: str = "canslim_v35_capital_efficiency"
 
 # ==========================================
 # 2. Data & Indicators
@@ -99,7 +100,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v34.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v35.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -206,9 +207,6 @@ def get_bull_flag(highs, lows, vols, closes, n):
     max_in_flag = float(np.max(highs[absolute_peak_idx+1 : -1]))
     if max_in_flag > pole_peak_val * 1.01: return None 
 
-    # <<< התיקון הקריטי מבוסס קו מגמה יורד (Descending Channel) >>>
-    # במקום ששיא התורן יהיה הפיבוט, הפיבוט הוא השיא של ההתכנסות בימים האחרונים של הדגל.
-    # זה מדמה קנייה מדויקת בפריצה של התעלה היורדת!
     local_resistance_start = max(absolute_peak_idx + 1, n - 5)
     if local_resistance_start >= n - 1:
         local_resistance_start = absolute_peak_idx + 1
@@ -291,7 +289,7 @@ def check_classical_patterns(hist):
     return None
 
 # ==========================================
-# 5. Patient Trade Simulation (V32 Let it Ride)
+# 5. Patient Trade Simulation (Scale Out)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -397,7 +395,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks... (Fixed Bull Flag Pivot)")
+    print(f"\nScanning {len(tickers)} stocks... (Aggressive Capital Allocation Applied)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -647,12 +645,8 @@ def calc_drawdown(equity_curve: pd.Series) -> float:
     return round(dd.min() * 100, 2)
 
 def summarize_trades(trades_df: pd.DataFrame, equity_df: pd.DataFrame | None = None) -> dict:
-    empty = {
-        "Trades": 0, "Wins": 0, "Losses": 0, "Win_Rate_Pct": 0.0, 
-        "Avg_Trade_Pct": 0.0, "Avg_Win_Pct": 0.0, "Avg_Loss_Pct": 0.0,
-        "Total_Return_Pct": 0.0, "Max_Drawdown_Pct": 0.0, "Net_PnL": 0.0
-    }
-    if trades_df.empty: return empty
+    if trades_df.empty:
+        return {"Trades": 0, "Wins": 0, "Losses": 0, "Win_Rate_Pct": 0.0, "Avg_Trade_Pct": 0.0, "Avg_Win_Pct": 0.0, "Avg_Loss_Pct": 0.0, "Total_Return_Pct": 0.0, "Max_Drawdown_Pct": 0.0, "Net_PnL": 0.0}
 
     wins = trades_df[trades_df["Pct_Change"] > 0]
     losses = trades_df[trades_df["Pct_Change"] < 0]
@@ -757,7 +751,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v34 - Flag Channel Breakout)")
+    print("VCP BACKTEST REPORT (v35 - Capital Efficiency & Aggressive Sizing)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
