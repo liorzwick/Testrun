@@ -22,14 +22,17 @@ class BacktestConfig:
     benchmark: str = "SPY"
     initial_capital: float = 100_000.0
     
-    # --- מערכת הקצאת הון אגרסיבית (V35) ---
-    risk_per_trade: float = 0.0125     # סיכון של 1.25% מהתיק על כל טרייד (במקום 0.5%)
-    max_alloc_pct: float = 0.25        # מאפשר קניית מניה עד 25% משווי התיק (במקום 12%)
-    max_portfolio_heat: float = 0.08   # מאפשר חשיפת סיכון כוללת של 8% על כל התיק
-    cooldown_days: int = 3             # כניסה מחדש מותרת תוך 3 ימים (במקום 15)
+    # --- מנגנון הגנה משחיקה (Anti-Drawdown Protocol - V36) ---
+    risk_per_trade: float = 0.010        # סיכון בסיס של 1% לעסקה (מאוזן ומדויק)
+    drawdown_risk_cut_threshold: float = -0.05 # ברגע שהתיק יורד ב-5% מהשיא, הסיכון נחתך בחצי!
+    max_new_trades_per_day: int = 2      # "טעימת מים": הבוט רשאי לקנות מקסימום 2 מניות ביום כדי לא להיתקע במלכודת שוק
+    
+    max_alloc_pct: float = 0.20          # מקסימום 20% מהתיק למניה (מאפשר עד 5 מניות בתיק במלוא העוצמה)
+    max_positions: int = 8               # סך הכל מקסימום 8 מניות במקביל
+    max_portfolio_heat: float = 0.06     # חשיפת סיכון כוללת של מקסימום 6% על התיק במקביל
+    cooldown_days: int = 3               
     
     custom_tickers_file: str = "mystock.csv" 
-    max_positions: int = 10            
     slippage_bps: float = 12
     commission_bps: float = 2
     
@@ -58,7 +61,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v35_capital_efficiency"
+    output_prefix: str = "canslim_v36_anti_drawdown"
 
 # ==========================================
 # 2. Data & Indicators
@@ -100,7 +103,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v35.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v36.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -395,7 +398,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks... (Aggressive Capital Allocation Applied)")
+    print(f"\nScanning {len(tickers)} stocks... (Anti-Drawdown Protocol Active)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -484,7 +487,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     return pd.DataFrame(candidates).sort_values(["Entry_Date", "Volume_Ratio"], ascending=[True, False]).reset_index(drop=True)
 
 # ==========================================
-# 7. Portfolio Management
+# 7. Portfolio Management (Anti-Drawdown Protocol)
 # ==========================================
 def get_close_on_or_before(df: pd.DataFrame, dt: pd.Timestamp, fallback: float) -> float:
     x = df[df.index <= dt]
@@ -494,14 +497,21 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
     if candidates.empty: return pd.DataFrame()
 
     cash = cfg.initial_capital
+    running_peak = cfg.initial_capital # מעקב אחרי שיא התיק לדרודאון
+    
     active = []
     accepted = []
     last_exit_by_ticker = {}
+    trades_by_date_count = {} # סופר כמה מניות קנינו היום
 
     cand_records = candidates.to_dict("records")
     for cand in cand_records:
         entry_date = pd.Timestamp(cand["Entry_Date"])
         ticker = str(cand["Ticker"])
+        
+        # 1. הגבלת קצב: טעימת מים - לא קונים יותר מ-2 ביום!
+        if trades_by_date_count.get(entry_date, 0) >= cfg.max_new_trades_per_day:
+            continue
 
         if ticker in last_exit_by_ticker and entry_date <= last_exit_by_ticker[ticker] + pd.Timedelta(days=cfg.cooldown_days):
             continue
@@ -522,17 +532,27 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
         if any(pos["Ticker"] == ticker for pos in active): continue
         if len(active) >= cfg.max_positions: continue
 
+        # חישוב ערך התיק הנוכחי
         equity = cash + sum(
             get_close_on_or_before(data_cache[p["Ticker"]], entry_date, p["Entry_Price"]) * p["Shares"]
             for p in active
         )
+        
+        # עדכון שיא התיק וחישוב הדרודאון הנוכחי
+        running_peak = max(running_peak, equity)
+        current_dd = (equity / max(running_peak, 1e-9)) - 1.0
+
+        # 2. מגן שחיקה: חיתוך סיכון בחצי אם התיק בדרודאון עמוק מ-5%!
+        actual_risk_pct = cfg.risk_per_trade
+        if current_dd <= cfg.drawdown_risk_cut_threshold:
+            actual_risk_pct = cfg.risk_per_trade / 2.0 
 
         entry_price = float(cand["Entry_Price"])
         stop_price = float(cand["Stop_Price"])
         exit_price = float(cand["Exit_Price"])
 
         risk_per_share = max(entry_price - stop_price, 1e-9)
-        max_risk_dollars_trade = equity * cfg.risk_per_trade
+        max_risk_dollars_trade = equity * actual_risk_pct # שימוש בסיכון המותאם
         current_heat = sum(float(pos.get("Risk_Dollars", 0.0)) for pos in active)
         max_heat = equity * cfg.max_portfolio_heat
         remaining_heat = max(0.0, max_heat - current_heat)
@@ -570,6 +590,9 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
             "Entry_Price": entry_price, "Exit_Price": exit_price, "Shares": shares, "Exit_Fee": exit_fee,
             "Risk_Dollars": t["Risk_Dollars"],
         })
+        
+        # רישום העסקה במערכת "טעימת מים"
+        trades_by_date_count[entry_date] = trades_by_date_count.get(entry_date, 0) + 1
 
     if not accepted: return pd.DataFrame()
     return pd.DataFrame(accepted).sort_values(["Entry_Date", "Exit_Date", "Ticker"]).reset_index(drop=True)
@@ -645,8 +668,12 @@ def calc_drawdown(equity_curve: pd.Series) -> float:
     return round(dd.min() * 100, 2)
 
 def summarize_trades(trades_df: pd.DataFrame, equity_df: pd.DataFrame | None = None) -> dict:
-    if trades_df.empty:
-        return {"Trades": 0, "Wins": 0, "Losses": 0, "Win_Rate_Pct": 0.0, "Avg_Trade_Pct": 0.0, "Avg_Win_Pct": 0.0, "Avg_Loss_Pct": 0.0, "Total_Return_Pct": 0.0, "Max_Drawdown_Pct": 0.0, "Net_PnL": 0.0}
+    empty = {
+        "Trades": 0, "Wins": 0, "Losses": 0, "Win_Rate_Pct": 0.0, 
+        "Avg_Trade_Pct": 0.0, "Avg_Win_Pct": 0.0, "Avg_Loss_Pct": 0.0,
+        "Total_Return_Pct": 0.0, "Max_Drawdown_Pct": 0.0, "Net_PnL": 0.0
+    }
+    if trades_df.empty: return empty
 
     wins = trades_df[trades_df["Pct_Change"] > 0]
     losses = trades_df[trades_df["Pct_Change"] < 0]
@@ -751,7 +778,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v35 - Capital Efficiency & Aggressive Sizing)")
+    print("VCP BACKTEST REPORT (v36 - Anti-Drawdown Protocol)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
@@ -787,7 +814,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
             print("💡 למה הבוט נכנס? (נתוני הפריצה):")
             print(f"   - פיצוץ ווליום מוסדי: פי {best_trade['Volume_Ratio']} ממוצע 50 יום")
             print(f"   - כיווץ (Tightness): {best_trade['Tightness_Pct']}%")
-            print(f"   - עומק הבסיס: {best_trade['Base_Depth_Pct']}%")
+            print(f"   - עומק הבסיס/דגל: {best_trade['Base_Depth_Pct']}%")
             print(f"   - אורך התבנית: {best_trade['Base_Length']} ימים")
             print(f"   - חוזק סגירה יומית: {best_trade['Close_Strength']}")
             print(f"   - עוצמה יחסית (RS): {best_trade['RS_65']}")
