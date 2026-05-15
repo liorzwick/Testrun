@@ -22,14 +22,10 @@ class BacktestConfig:
     benchmark: str = "SPY"
     initial_capital: float = 100_000.0
     
-    # --- מנגנון הגנה משחיקה (Anti-Drawdown Protocol - V36) ---
-    risk_per_trade: float = 0.010        # סיכון בסיס של 1% לעסקה (מאוזן ומדויק)
-    drawdown_risk_cut_threshold: float = -0.05 # ברגע שהתיק יורד ב-5% מהשיא, הסיכון נחתך בחצי!
-    max_new_trades_per_day: int = 2      # "טעימת מים": הבוט רשאי לקנות מקסימום 2 מניות ביום כדי לא להיתקע במלכודת שוק
-    
-    max_alloc_pct: float = 0.20          # מקסימום 20% מהתיק למניה (מאפשר עד 5 מניות בתיק במלוא העוצמה)
-    max_positions: int = 8               # סך הכל מקסימום 8 מניות במקביל
-    max_portfolio_heat: float = 0.06     # חשיפת סיכון כוללת של מקסימום 6% על התיק במקביל
+    risk_per_trade: float = 0.0125       
+    max_alloc_pct: float = 0.20          
+    max_positions: int = 8               
+    max_portfolio_heat: float = 0.10     
     cooldown_days: int = 3               
     
     custom_tickers_file: str = "mystock.csv" 
@@ -46,7 +42,10 @@ class BacktestConfig:
     time_stop_bars: int = 18           
     min_profit_after_time_stop: float = 0.015 
     
-    min_rs_65: float = 0.05            
+    # --- מערכת "חריג מנהיגות השוק" לשוק דובי (V38) ---
+    min_rs_65: float = 0.05            # עוצמה יחסית רגילה נדרשת בשוק שוורי
+    bear_market_rs_threshold: float = 0.25 # "חריג הזהב": עוצמה יחסית פסיכית נדרשת בשוק דובי/קריסה
+    
     min_breakout_close_strength: float = 0.55
     max_dist_from_52w_high: float = 0.40 
     
@@ -61,7 +60,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v36_anti_drawdown"
+    output_prefix: str = "canslim_v38_bear_market_leaders"
 
 # ==========================================
 # 2. Data & Indicators
@@ -103,7 +102,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v36.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v38.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -122,15 +121,8 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     return pd.DataFrame()
 
 # ==========================================
-# 3. Universe & Filters
+# 3. Filters
 # ==========================================
-def market_filter_ok(spy_df: pd.DataFrame, current_date: pd.Timestamp) -> bool:
-    x = spy_df[spy_df.index <= current_date]
-    if len(x) < 220: return False
-    row = x.iloc[-1]
-    if pd.isna(row["SMA_200"]) or pd.isna(row["SMA_21"]): return False
-    return float(row["Close"]) > float(row["SMA_200"]) and float(row["Close"]) > float(row["SMA_21"])
-
 def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     required = ["SMA_21", "SMA_50", "SMA_150", "SMA_200", "Vol_50", "ATR_14", "ATR_Pct", "ROC_65", "DollarVol_50", "High_252"]
     for c in required:
@@ -394,11 +386,11 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
             "MAE_Pct": round((lowest_seen/max(entry_price, 1e-9)-1)*100, 2)}
 
 # ==========================================
-# 6. Candidate Generation
+# 6. Candidate Generation (With Market Override)
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks... (Anti-Drawdown Protocol Active)")
+    print(f"\nScanning {len(tickers)} stocks... (Market Leader Override Active)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -411,8 +403,16 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
 
                 test_days = df[(df.index >= test_start) & (df.index <= test_end)].index
                 for current_date in test_days:
-                    if not market_filter_ok(spy_df, current_date): continue
-
+                    
+                    # --- הוספת לוגיקת ה-Decoupling (התנתקות מנהיגי שוק) ---
+                    spy_past = spy_df[spy_df.index <= current_date]
+                    if spy_past.empty or len(spy_past) < 200: continue
+                    spy_today = spy_past.iloc[-1]
+                    
+                    if pd.isna(spy_today["SMA_200"]) or pd.isna(spy_today["SMA_50"]) or pd.isna(spy_today["SMA_21"]): continue
+                    
+                    is_bull_or_recovering = float(spy_today["Close"]) > float(spy_today["SMA_21"]) or float(spy_today["Close"]) > float(spy_today["SMA_50"])
+                    
                     past_data = df[df.index <= current_date]
                     if len(past_data) < 251: continue
 
@@ -422,11 +422,18 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
 
                     if not stock_filter_ok(today, cfg): continue
                     
-                    spy_past = spy_df[spy_df.index <= current_date]
-                    if not spy_past.empty:
-                        spy_rs = float(spy_past.iloc[-1]["ROC_65"])
-                        stock_rs = float(today["ROC_65"])
-                        if (stock_rs - spy_rs) < cfg.min_rs_65: continue
+                    spy_rs = float(spy_today["ROC_65"])
+                    stock_rs_absolute = float(today["ROC_65"])
+                    stock_rs_relative = stock_rs_absolute - spy_rs
+                    
+                    # יישום החריג - אם השוק מתרסק (מתחת לממוצעים), נקנה רק "זהב טהור"
+                    if not is_bull_or_recovering:
+                        if stock_rs_relative < cfg.bear_market_rs_threshold:
+                            continue # המניה לא חזקה מספיק כדי להתעלם מהשוק הקורס
+                    else:
+                        if stock_rs_relative < cfg.min_rs_65:
+                            continue # בשוק רגיל דורשים עוצמה רגילה
+                    # -------------------------------------------------------------
 
                     pattern = check_classical_patterns(lookback_data)
                     if pattern is None: continue
@@ -475,7 +482,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                         "Risk_Pct": round(risk_pct * 100, 2), "Stop_Price": round(initial_stop, 2),
                         "Base_Depth_Pct": round(pattern["base_depth"] * 100, 2), "Tightness_Pct": round(pattern["tightness"] * 100, 2),
                         "Base_Length": int(pattern["base_length"]), 
-                        "Volume_Ratio": round(vol_ratio, 2), "RS_65": round(stock_rs, 4), 
+                        "Volume_Ratio": round(vol_ratio, 2), "RS_65": round(stock_rs_relative, 4), 
                         "Close_Strength": round(close_strength, 4), "Gap_From_Pivot": round(gap_from_pivot, 4),
                         "Hold_Bars": sim["Hold_Bars"], "Result": classify_pnl(sim["Pct_Change"]),
                         "Exit_Reason": sim["Exit_Reason"], "MFE_Pct": sim["MFE_Pct"], "MAE_Pct": sim["MAE_Pct"]
@@ -487,7 +494,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     return pd.DataFrame(candidates).sort_values(["Entry_Date", "Volume_Ratio"], ascending=[True, False]).reset_index(drop=True)
 
 # ==========================================
-# 7. Portfolio Management (Anti-Drawdown Protocol)
+# 7. Portfolio Management
 # ==========================================
 def get_close_on_or_before(df: pd.DataFrame, dt: pd.Timestamp, fallback: float) -> float:
     x = df[df.index <= dt]
@@ -497,21 +504,14 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
     if candidates.empty: return pd.DataFrame()
 
     cash = cfg.initial_capital
-    running_peak = cfg.initial_capital # מעקב אחרי שיא התיק לדרודאון
-    
     active = []
     accepted = []
     last_exit_by_ticker = {}
-    trades_by_date_count = {} # סופר כמה מניות קנינו היום
 
     cand_records = candidates.to_dict("records")
     for cand in cand_records:
         entry_date = pd.Timestamp(cand["Entry_Date"])
         ticker = str(cand["Ticker"])
-        
-        # 1. הגבלת קצב: טעימת מים - לא קונים יותר מ-2 ביום!
-        if trades_by_date_count.get(entry_date, 0) >= cfg.max_new_trades_per_day:
-            continue
 
         if ticker in last_exit_by_ticker and entry_date <= last_exit_by_ticker[ticker] + pd.Timedelta(days=cfg.cooldown_days):
             continue
@@ -530,29 +530,30 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
         active = still_active
 
         if any(pos["Ticker"] == ticker for pos in active): continue
-        if len(active) >= cfg.max_positions: continue
 
-        # חישוב ערך התיק הנוכחי
+        past_closed = [t for t in accepted if pd.Timestamp(t["Exit_Date"]) < entry_date]
+        recent_closed = sorted(past_closed, key=lambda x: pd.Timestamp(x["Exit_Date"]))[-5:]
+        
+        allowed_max_positions = cfg.max_positions
+        if len(recent_closed) >= 3:
+            recent_wins = sum(1 for t in recent_closed if float(t["Pct_Change"]) > 0)
+            recent_win_rate = recent_wins / len(recent_closed)
+            if recent_win_rate < 0.40:
+                allowed_max_positions = 2
+
+        if len(active) >= allowed_max_positions: continue
+
         equity = cash + sum(
             get_close_on_or_before(data_cache[p["Ticker"]], entry_date, p["Entry_Price"]) * p["Shares"]
             for p in active
         )
-        
-        # עדכון שיא התיק וחישוב הדרודאון הנוכחי
-        running_peak = max(running_peak, equity)
-        current_dd = (equity / max(running_peak, 1e-9)) - 1.0
-
-        # 2. מגן שחיקה: חיתוך סיכון בחצי אם התיק בדרודאון עמוק מ-5%!
-        actual_risk_pct = cfg.risk_per_trade
-        if current_dd <= cfg.drawdown_risk_cut_threshold:
-            actual_risk_pct = cfg.risk_per_trade / 2.0 
 
         entry_price = float(cand["Entry_Price"])
         stop_price = float(cand["Stop_Price"])
         exit_price = float(cand["Exit_Price"])
 
         risk_per_share = max(entry_price - stop_price, 1e-9)
-        max_risk_dollars_trade = equity * actual_risk_pct # שימוש בסיכון המותאם
+        max_risk_dollars_trade = equity * cfg.risk_per_trade 
         current_heat = sum(float(pos.get("Risk_Dollars", 0.0)) for pos in active)
         max_heat = equity * cfg.max_portfolio_heat
         remaining_heat = max(0.0, max_heat - current_heat)
@@ -590,9 +591,6 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
             "Entry_Price": entry_price, "Exit_Price": exit_price, "Shares": shares, "Exit_Fee": exit_fee,
             "Risk_Dollars": t["Risk_Dollars"],
         })
-        
-        # רישום העסקה במערכת "טעימת מים"
-        trades_by_date_count[entry_date] = trades_by_date_count.get(entry_date, 0) + 1
 
     if not accepted: return pd.DataFrame()
     return pd.DataFrame(accepted).sort_values(["Entry_Date", "Exit_Date", "Ticker"]).reset_index(drop=True)
@@ -668,12 +666,8 @@ def calc_drawdown(equity_curve: pd.Series) -> float:
     return round(dd.min() * 100, 2)
 
 def summarize_trades(trades_df: pd.DataFrame, equity_df: pd.DataFrame | None = None) -> dict:
-    empty = {
-        "Trades": 0, "Wins": 0, "Losses": 0, "Win_Rate_Pct": 0.0, 
-        "Avg_Trade_Pct": 0.0, "Avg_Win_Pct": 0.0, "Avg_Loss_Pct": 0.0,
-        "Total_Return_Pct": 0.0, "Max_Drawdown_Pct": 0.0, "Net_PnL": 0.0
-    }
-    if trades_df.empty: return empty
+    if trades_df.empty:
+        return {"Trades": 0, "Wins": 0, "Losses": 0, "Win_Rate_Pct": 0.0, "Avg_Trade_Pct": 0.0, "Avg_Win_Pct": 0.0, "Avg_Loss_Pct": 0.0, "Total_Return_Pct": 0.0, "Max_Drawdown_Pct": 0.0, "Net_PnL": 0.0}
 
     wins = trades_df[trades_df["Pct_Change"] > 0]
     losses = trades_df[trades_df["Pct_Change"] < 0]
@@ -778,7 +772,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v36 - Anti-Drawdown Protocol)")
+    print("VCP BACKTEST REPORT (v38 - The Alpha Override / Bear Market Leaders)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
