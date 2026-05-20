@@ -60,7 +60,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v39_dtw_vision"
+    output_prefix: str = "canslim_v40_dtw_lightning"
 
 # ==========================================
 # 2. Data & Indicators
@@ -102,7 +102,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v39.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v40.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -273,7 +273,7 @@ def check_classical_patterns(hist):
     return best_pattern
 
 # ==========================================
-# 5. Patient Trade Simulation (V32 Let it Ride)
+# 5. Patient Trade Simulation (Let it Ride)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -375,11 +375,11 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
             "MAE_Pct": round((lowest_seen/max(entry_price, 1e-9)-1)*100, 2)}
 
 # ==========================================
-# 6. Candidate Generation
+# 6. Candidate Generation (Lightning Fast Optimization)
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks... (Computer Vision DTW Logic Active)")
+    print(f"\nScanning {len(tickers)} stocks... (Lightning Fast DTW Logic Active)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -410,6 +410,17 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
 
                     if not stock_filter_ok(today, cfg): continue
                     
+                    # --- פילטרים מהירים לפני DTW (חיסכון של 95% מהזמן!) ---
+                    # 1. דרישת ווליום גבוה של יום פריצה
+                    vol_ratio = float(today["Volume"]) / max(float(today["Vol_50"]), 1e-9)
+                    if vol_ratio < cfg.breakout_volume_ratio: continue
+
+                    # 2. דרישת חוזק סגירה גבוה
+                    day_range = max(float(today["High"]) - float(today["Low"]), 1e-9)
+                    close_strength = (float(today["Close"]) - float(today["Low"])) / day_range
+                    if close_strength < cfg.min_breakout_close_strength: continue
+                    
+                    # 3. דרישת עוצמה יחסית לשוק (RS)
                     spy_rs = float(spy_today["ROC_65"])
                     stock_rs_absolute = float(today["ROC_65"])
                     stock_rs_relative = stock_rs_absolute - spy_rs
@@ -421,6 +432,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                         if stock_rs_relative < cfg.min_rs_65:
                             continue 
 
+                    # ---> רק אם המניה עוברת את כל הפילטרים המהירים האלו, נפעיל את ה-DTW הכבד! <---
                     pattern = check_classical_patterns(lookback_data)
                     if pattern is None: continue
 
@@ -429,13 +441,6 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                     close = float(today["Close"])
                     
                     if not (prev_close <= pivot and close > pivot): continue
-
-                    day_range = max(float(today["High"]) - float(today["Low"]), 1e-9)
-                    close_strength = (close - float(today["Low"])) / day_range
-                    if close_strength < cfg.min_breakout_close_strength: continue
-
-                    vol_ratio = float(today["Volume"]) / max(float(today["Vol_50"]), 1e-9)
-                    if vol_ratio < cfg.breakout_volume_ratio: continue
 
                     next_bar = df[df.index > current_date].head(1)
                     if next_bar.empty: continue
@@ -758,7 +763,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v39 - DTW Vision + Auto-Brake Pilot Mode)")
+    print("VCP BACKTEST REPORT (v40 - Lightning DTW + Pilot Mode)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
