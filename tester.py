@@ -9,6 +9,7 @@ import time
 from tqdm import tqdm
 import os
 import json
+from fastdtw import fastdtw
 
 warnings.filterwarnings("ignore")
 
@@ -37,17 +38,16 @@ class BacktestConfig:
     min_price: float = 8.0               
     
     min_risk_pct: float = 0.01         
-    max_risk_pct: float = 0.10         
+    max_risk_pct: float = 0.12         
     max_hold_bars: int = 150           
     time_stop_bars: int = 18           
     min_profit_after_time_stop: float = 0.015 
     
-    # --- מערכת "חריג מנהיגות השוק" לשוק דובי (V38) ---
-    min_rs_65: float = 0.05            # עוצמה יחסית רגילה נדרשת בשוק שוורי
-    bear_market_rs_threshold: float = 0.25 # "חריג הזהב": עוצמה יחסית פסיכית נדרשת בשוק דובי/קריסה
+    min_rs_65: float = 0.03            
+    bear_market_rs_threshold: float = 0.25 
     
     min_breakout_close_strength: float = 0.55
-    max_dist_from_52w_high: float = 0.40 
+    max_dist_from_52w_high: float = 0.45 
     
     max_pivot_extension: float = 0.04  
     max_entry_extension: float = 0.04  
@@ -60,7 +60,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v38_bear_market_leaders"
+    output_prefix: str = "canslim_v39_dtw_vision"
 
 # ==========================================
 # 2. Data & Indicators
@@ -102,7 +102,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v38.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v39.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -137,154 +137,143 @@ def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     return True
 
 # ==========================================
-# 4. Pattern Detection (Multi Pattern)
+# 4. Pattern Detection (COMPUTER VISION DTW)
 # ==========================================
-def get_cup_and_handle(highs, lows, vols, closes, n):
-    if n < 60: return None
-    recent_highs = highs[:-20]
-    if len(recent_highs) == 0: return None
-    left_lip_idx = int(np.argmax(recent_highs))
-    left_lip_val = float(recent_highs[left_lip_idx])
+def normalize_series(series):
+    series_array = np.array(series)
+    min_val = np.min(series_array)
+    max_val = np.max(series_array)
+    if max_val == min_val:
+        return np.zeros(len(series_array))
+    return (series_array - min_val) / (max_val - min_val)
 
-    if left_lip_idx > len(recent_highs) - 10: return None 
-    cup_low_idx = left_lip_idx + int(np.argmin(lows[left_lip_idx: -5]))
-    cup_low_val = float(lows[cup_low_idx])
+def get_dtw_templates():
+    templates = {}
+    
+    pole = np.linspace(0, 1.0, 10)
+    flag_trend = np.linspace(1.0, 0.7, 20)
+    flag_waves = flag_trend + np.sin(np.linspace(0, 4*np.pi, 20)) * 0.05 
+    templates["Bull Flag"] = {
+        "data": np.concatenate((pole, flag_waves)), 
+        "windows": [20, 30, 45], "threshold": 0.12, "min_corr": 0.88, "comp": 0
+    }
 
-    cup_depth = (left_lip_val - cup_low_val) / max(left_lip_val, 1e-9)
-    if cup_depth < 0.12 or cup_depth > 0.45: return None 
+    rise = np.linspace(0, 1.0, 10)
+    initial_pullback = np.linspace(1.0, 0.8, 5) 
+    box = np.ones(35) * 0.9 + np.sin(np.linspace(0, 6*np.pi, 35)) * 0.05
+    templates["Darvas Box"] = {
+        "data": np.concatenate((rise, initial_pullback, box)), 
+        "windows": [40, 60, 90], "threshold": 0.12, "min_corr": 0.85, "comp": 1
+    }
 
-    right_side_highs = highs[cup_low_idx : -2]
-    if len(right_side_highs) == 0: return None
-    right_lip_idx = cup_low_idx + int(np.argmax(right_side_highs))
-    right_lip_val = float(highs[right_lip_idx])
+    l_drop = np.linspace(1.0, 0.1, 15)  
+    m_up = np.linspace(0.1, 0.6, 15)    
+    m_down = np.linspace(0.6, 0.0, 15)  
+    r_up = np.linspace(0.0, 1.0, 15)    
+    templates["Double Bottom"] = {
+        "data": np.concatenate((l_drop, m_up, m_down, r_up)), 
+        "windows": [50, 80, 120, 180], "threshold": 0.15, "min_corr": 0.82, "comp": 2
+    }
 
-    if abs(left_lip_val - right_lip_val) / max(left_lip_val, 1e-9) > 0.12: return None 
-    pivot = max(left_lip_val, right_lip_val)
+    left_cup = np.linspace(-1, 0, 45)**2
+    right_cup = np.linspace(0, 1, 20)**2
+    handle_trend = np.linspace(1.0, 0.7, 15)
+    handle_waves = handle_trend + np.cos(np.linspace(0, 2*np.pi, 15)) * 0.03
+    templates["Cup & Handle"] = {
+        "data": np.concatenate((left_cup, right_cup, handle_waves)), 
+        "windows": [60, 90, 150, 250], "threshold": 0.15, "min_corr": 0.82, "comp": 2
+    }
 
-    handle_len = (len(highs) - 1) - right_lip_idx
-    if handle_len < 3 or handle_len > 60: return None 
-
-    handle_low = float(np.min(lows[right_lip_idx:]))
-    handle_depth = (right_lip_val - handle_low) / max(right_lip_val, 1e-9)
-
-    if handle_depth > cup_depth * 0.5: return None 
-    if handle_low < cup_low_val + (pivot - cup_low_val) * 0.4: return None 
-
-    return {"type": "Cup & Handle", "pivot_price": pivot, "tight_low": handle_low, "base_depth": cup_depth, "tightness": handle_depth, "base_length": len(highs) - left_lip_idx}
-
-def get_bull_flag(highs, lows, vols, closes, n):
-    if n < 40: return None
-    search_window = highs[-40:-3] 
-    if len(search_window) == 0: return None
-
-    pole_peak_idx_local = int(np.argmax(search_window))
-    absolute_peak_idx = (n - 40) + pole_peak_idx_local
-    pole_peak_val = float(highs[absolute_peak_idx])
-
-    start_search_idx = max(0, absolute_peak_idx - 20)
-    pole_start_val = float(np.min(lows[start_search_idx : absolute_peak_idx]))
-
-    pole_height = (pole_peak_val - pole_start_val) / max(pole_start_val, 1e-9)
-    if pole_height < 0.25: return None 
-
-    flag_length = (n - 1) - absolute_peak_idx
-    if flag_length < 3 or flag_length > 21: return None 
-
-    flag_lows = lows[absolute_peak_idx : -1]
-    if len(flag_lows) == 0: return None
-    flag_low = float(np.min(flag_lows))
-
-    flag_depth = (pole_peak_val - flag_low) / max(pole_peak_val, 1e-9)
-    if flag_depth < 0.02 or flag_depth > 0.15: return None 
-
-    if flag_low < pole_start_val + (pole_peak_val - pole_start_val) * 0.5: return None
-
-    max_in_flag = float(np.max(highs[absolute_peak_idx+1 : -1]))
-    if max_in_flag > pole_peak_val * 1.01: return None 
-
-    local_resistance_start = max(absolute_peak_idx + 1, n - 5)
-    if local_resistance_start >= n - 1:
-        local_resistance_start = absolute_peak_idx + 1
-        
-    local_flag_high = float(np.max(highs[local_resistance_start : -1]))
-    pivot = local_flag_high
-
-    return {"type": "Bull Flag", "pivot_price": pivot, "tight_low": flag_low, "base_depth": flag_depth, "tightness": flag_depth, "base_length": flag_length}
-
-def get_darvas_box(highs, lows, vols, closes, n):
-    box_length = 30 
-    if n < box_length + 40: return None
-
-    window_highs = highs[-box_length:-2]
-    window_lows = lows[-box_length:-2]
-    window_closes = closes[-box_length:-2]
-
-    box_top = float(np.max(window_highs))
-    box_bottom = float(np.min(window_lows))
-
-    box_depth = (box_top - box_bottom) / max(box_top, 1e-9)
-    if box_depth < 0.04 or box_depth > 0.12: return None 
-
-    days_in_box = np.sum((window_closes >= box_bottom * 0.98) & (window_closes <= box_top * 1.02))
-    if (days_in_box / len(window_closes)) < 0.85: return None 
-
-    top_touches = np.where(window_highs >= box_top * 0.985)[0]
-    if len(top_touches) < 2: return None
-    if top_touches[-1] - top_touches[0] < 12: return None 
-
-    return {"type": "Darvas Box", "pivot_price": box_top, "tight_low": box_bottom, "base_depth": box_depth, "tightness": box_depth, "base_length": box_length}
-
-def get_double_bottom(highs, lows, vols, n):
-    if n < 100: return None
-    recent_lows = lows[-300:-20]
-    if len(recent_lows) == 0: return None
-    left_bottom_idx = int(np.argmin(recent_lows))
-    left_bottom_val = float(recent_lows[left_bottom_idx])
-
-    mid_section = highs[left_bottom_idx : -5]
-    if len(mid_section) < 10: return None
-    mid_peak_idx = left_bottom_idx + int(np.argmax(mid_section))
-    mid_peak_val = float(highs[mid_peak_idx])
-
-    right_section = lows[mid_peak_idx : -1]
-    if len(right_section) < 5: return None
-    right_bottom_idx = mid_peak_idx + int(np.argmin(right_section))
-    right_bottom_val = float(lows[right_bottom_idx])
-
-    if abs(left_bottom_val - right_bottom_val) / max(left_bottom_val, 1e-9) > 0.08: return None 
-
-    base_depth = (mid_peak_val - min(left_bottom_val, right_bottom_val)) / max(mid_peak_val, 1e-9)
-    if base_depth < 0.10 or base_depth > 0.40: return None 
-
-    pivot = mid_peak_val
-    tight_low = float(np.min(lows[right_bottom_idx:]))
-    tightness = (pivot - tight_low) / max(pivot, 1e-9)
-
-    return {"type": "Double Bottom", "pivot_price": pivot, "tight_low": tight_low, "base_depth": base_depth, "tightness": tightness, "base_length": right_bottom_idx - left_bottom_idx}
+    return templates
 
 def check_classical_patterns(hist):
-    hist_filtered = hist.dropna(subset=['High', 'Low', 'Volume', 'Close'])
-    if len(hist_filtered) < 60: return None
-
-    highs = hist_filtered["High"].astype(float).values
-    lows = hist_filtered["Low"].astype(float).values
-    vols = hist_filtered["Volume"].astype(float).values
+    hist_filtered = hist.dropna(subset=['Close'])
+    if len(hist_filtered) < 30: return None
     closes = hist_filtered["Close"].astype(float).values
-    n = len(hist_filtered)
+    
+    templates = get_dtw_templates()
+    best_pattern = None
+    best_score = float('inf')
 
-    pattern = get_bull_flag(highs, lows, vols, closes, n)
-    if pattern: return pattern
-    pattern = get_cup_and_handle(highs, lows, vols, closes, n)
-    if pattern: return pattern
-    pattern = get_double_bottom(highs, lows, vols, n)
-    if pattern: return pattern
-    pattern = get_darvas_box(highs, lows, vols, closes, n)
-    if pattern: return pattern
+    for name, config in templates.items():
+        for window in config["windows"]:
+            if len(closes) < window:
+                continue
+            
+            current_closes = closes[-window:]
+            
+            raw_min = np.min(current_closes)
+            raw_max = np.max(current_closes)
+            if raw_min == 0 or (raw_max - raw_min) / raw_min < 0.10:
+                continue
+                
+            norm_current = normalize_series(current_closes)
+            
+            if np.std(norm_current) > 0.35:
+                continue
 
-    return None
+            x_orig = np.linspace(0, 1, len(config["data"]))
+            x_new = np.linspace(0, 1, window)
+            resized_template = np.interp(x_new, x_orig, config["data"])
+            norm_template_resized = normalize_series(resized_template)
+            
+            corr = np.corrcoef(norm_current, norm_template_resized)[0, 1]
+            
+            if pd.isna(corr) or corr < config["min_corr"]:
+                continue
+                
+            w = window
+            if "Flag" in name:
+                start_price = current_closes[0]
+                end_price = current_closes[-1]
+                if end_price <= start_price * 1.05: continue
+                
+            elif "Cup" in name:
+                cup_bottom = np.min(current_closes[:int(w*0.8)])
+                handle_bottom = np.min(current_closes[-int(w*0.2):])
+                if handle_bottom < cup_bottom: continue
+
+            distance, path = fastdtw(norm_current, norm_template_resized, dist=lambda x, y: abs(x - y))
+            avg_distance = distance / window
+            
+            if avg_distance < config["threshold"] and avg_distance < best_score:
+                best_score = avg_distance
+                
+                if "Flag" in name:
+                    pivot = float(np.max(current_closes[:int(w*0.5)]))
+                    low = float(np.min(current_closes[-int(w*0.5):]))
+                elif "Darvas" in name:
+                    pivot = float(np.max(current_closes[-int(w*0.7):]))
+                    low = float(np.min(current_closes[-int(w*0.7):]))
+                elif "Bottom" in name:
+                    pivot = float(np.max(current_closes[int(w*0.3):int(w*0.7)]))
+                    low = float(np.min(current_closes[-int(w*0.4):]))
+                else: 
+                    pivot = float(np.max(current_closes[int(w*0.6):int(w*0.9)]))
+                    low = float(np.min(current_closes[-int(w*0.3):]))
+                
+                tightness = (pivot - low) / max(pivot, 1e-9)
+                
+                best_pattern = {
+                    "type": name,
+                    "dtw_distance": round(avg_distance, 3),
+                    "correlation": round(corr * 100, 1),
+                    "complexity_bonus": config["comp"],
+                    "threshold": config["threshold"],
+                    "pivot_price": pivot,
+                    "tight_low": low,
+                    "last_pullback_low": low,
+                    "tightness": tightness,
+                    "base_depth": 0.20, 
+                    "dry_up_ratio": 1.0, 
+                    "touches": 2,
+                    "base_length": window
+                }
+                
+    return best_pattern
 
 # ==========================================
-# 5. Patient Trade Simulation (Scale Out)
+# 5. Patient Trade Simulation (V32 Let it Ride)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -386,11 +375,11 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
             "MAE_Pct": round((lowest_seen/max(entry_price, 1e-9)-1)*100, 2)}
 
 # ==========================================
-# 6. Candidate Generation (With Market Override)
+# 6. Candidate Generation
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks... (Market Leader Override Active)")
+    print(f"\nScanning {len(tickers)} stocks... (Computer Vision DTW Logic Active)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -404,7 +393,6 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                 test_days = df[(df.index >= test_start) & (df.index <= test_end)].index
                 for current_date in test_days:
                     
-                    # --- הוספת לוגיקת ה-Decoupling (התנתקות מנהיגי שוק) ---
                     spy_past = spy_df[spy_df.index <= current_date]
                     if spy_past.empty or len(spy_past) < 200: continue
                     spy_today = spy_past.iloc[-1]
@@ -426,14 +414,12 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                     stock_rs_absolute = float(today["ROC_65"])
                     stock_rs_relative = stock_rs_absolute - spy_rs
                     
-                    # יישום החריג - אם השוק מתרסק (מתחת לממוצעים), נקנה רק "זהב טהור"
                     if not is_bull_or_recovering:
                         if stock_rs_relative < cfg.bear_market_rs_threshold:
-                            continue # המניה לא חזקה מספיק כדי להתעלם מהשוק הקורס
+                            continue 
                     else:
                         if stock_rs_relative < cfg.min_rs_65:
-                            continue # בשוק רגיל דורשים עוצמה רגילה
-                    # -------------------------------------------------------------
+                            continue 
 
                     pattern = check_classical_patterns(lookback_data)
                     if pattern is None: continue
@@ -772,7 +758,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v38 - The Alpha Override / Bear Market Leaders)")
+    print("VCP BACKTEST REPORT (v39 - DTW Vision + Auto-Brake Pilot Mode)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
@@ -808,7 +794,6 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
             print("💡 למה הבוט נכנס? (נתוני הפריצה):")
             print(f"   - פיצוץ ווליום מוסדי: פי {best_trade['Volume_Ratio']} ממוצע 50 יום")
             print(f"   - כיווץ (Tightness): {best_trade['Tightness_Pct']}%")
-            print(f"   - עומק הבסיס/דגל: {best_trade['Base_Depth_Pct']}%")
             print(f"   - אורך התבנית: {best_trade['Base_Length']} ימים")
             print(f"   - חוזק סגירה יומית: {best_trade['Close_Strength']}")
             print(f"   - עוצמה יחסית (RS): {best_trade['RS_65']}")
