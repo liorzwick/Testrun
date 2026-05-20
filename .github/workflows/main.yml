@@ -19,7 +19,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas yfinance numpy tqdm requests lxml
+          pip install pandas yfinance numpy tqdm requests lxml fastdtw scipy
 
       - name: Run the CANSLIM script
         run: python tester.py
