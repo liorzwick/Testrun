@@ -13,7 +13,7 @@ from fastdtw import fastdtw
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. CONFIGURATION (V50 - Fixed Engine & Core/Satellite)
+# 1. CONFIGURATION (V51 - Expectancy Maximizer)
 # ==========================================
 @dataclass
 class BacktestConfig:
@@ -22,12 +22,13 @@ class BacktestConfig:
     benchmark: str = "SPY"
     initial_capital: float = 100_000.0
 
-    # חלוקת הון: 50% לבוט אקטיבי, 50% לליבה מוגנת
+    # חלוקת הון (הליבה תמיד מוגנת)
     active_capital_allocation: float = 0.50 
 
-    risk_per_trade: float = 0.0125       
-    max_alloc_pct: float = 0.25          # עד 25% מההון האקטיבי (4 מניות גג!)
-    max_positions: int = 4               
+    # ריכוזיות קצה - 3 עסקאות בלבד, כל אחת 33.3% מהקופה האקטיבית
+    risk_per_trade: float = 0.02         # סיכון של 2% לטרייד (כדי שסטופים יהיו משמעותיים ויאפשרו פוזיציות גדולות)
+    max_alloc_pct: float = 0.333         
+    max_positions: int = 3               
     max_portfolio_heat: float = 0.06     
     max_new_trades_per_day: int = 2      
     cooldown_days: int = 3               
@@ -36,20 +37,21 @@ class BacktestConfig:
     slippage_bps: float = 12
     commission_bps: float = 2
 
-    # צלף טהור
     breakout_volume_ratio: float = 1.30  
     min_breakout_close_strength: float = 0.55 
     min_dollar_vol_50: float = 10_000_000 
     min_price: float = 8.0               
 
     min_risk_pct: float = 0.01         
-    max_risk_pct: float = 0.12         
+    max_risk_pct: float = 0.15         
     max_hold_bars: int = 150           
-    time_stop_bars: int = 18           
-    min_profit_after_time_stop: float = 0.015 
+    
+    # שחרור חנק הזמן (ניתן להן חודש שלם להתבשל כל עוד אין הפסד)
+    time_stop_bars: int = 21           
+    min_profit_after_time_stop: float = 0.0 
 
     min_rs_65: float = 0.05            
-    bear_market_rs_threshold: float = 0.15 # הבוט יחפש הזדמנויות גם בשוק דובי אם המניה פסיכית
+    bear_market_rs_threshold: float = 0.15 
     
     max_dist_from_52w_high: float = 0.45 
     max_pivot_extension: float = 0.04  
@@ -63,7 +65,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v50_fixed_engine"
+    output_prefix: str = "canslim_v51_expectancy_max"
 
 # ==========================================
 # 2. Data & Indicators
@@ -105,7 +107,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v50.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v51.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -140,7 +142,7 @@ def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     return True
 
 # ==========================================
-# 4. Pattern Detection (DYNAMIC DTW) - FIXED!
+# 4. Pattern Detection (DYNAMIC DTW)
 # ==========================================
 def normalize_series(series):
     series_array = np.array(series)
@@ -164,7 +166,6 @@ def get_dtw_templates():
 
     rise = np.linspace(0, 1.0, 10)
     initial_pullback = np.linspace(1.0, 0.8, 5) 
-    # פה היה הבאג שמחק לך את העסקאות לעשור! תוקן ל np.pi
     box = np.ones(35) * 0.9 + np.sin(np.linspace(0, 6*np.pi, 35)) * 0.05
     templates["Darvas Box"] = {
         "data": np.concatenate((rise, initial_pullback, box)), 
@@ -272,7 +273,7 @@ def check_classical_patterns(hist):
     return best_pattern
 
 # ==========================================
-# 5. Patient Trade Simulation (Custom Trailing)
+# 5. Patient Trade Simulation (AGGRESSIVE SCALING)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -292,7 +293,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 
     scaled_out = False
     scale_out_price = 0.0
-    scale_out_pct = 0.33 
+    scale_out_pct = 0.50 # מימוש אגרסיבי של חצי מהכמות כדי לנעול את הרווח במכה אחת!
 
     for i, row in enumerate(future.itertuples()):
         dt = row.Index
@@ -332,18 +333,25 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
         if profit_high >= 0.10: 
             new_stop = max(new_stop, entry_price * 1.01) 
 
-        if not scaled_out and profit_high >= 0.20: 
-            scaled_out = True
-            scale_out_price = entry_price * 1.20 
-            new_stop = max(new_stop, entry_price * 1.05) 
-
-        # --- חוק הטריילינג המותאם לתבנית ---
+        # --- חוק הטריילינג המותאם לתבנית (V51 Big Scale-Out) ---
         if pattern_type == "Bull Flag":
-            if profit_high >= 0.10: new_stop = max(new_stop, highest_seen * 0.94) # דגל חונקים בשיא
-            if profit_high >= 0.20: new_stop = max(new_stop, highest_seen * 0.93) 
+            # בדגלים: ממש 50% מהכמות כבר ברווח של 15%, שים סטופ קרוב כדי לא להחזיר
+            if profit_high >= 0.15 and not scaled_out:
+                scaled_out = True
+                scale_out_price = entry_price * 1.15
+                new_stop = max(new_stop, entry_price * 1.02) 
+                
+            if profit_high >= 0.10: new_stop = max(new_stop, highest_seen * 0.92) # 8% נסיגה בדגל
+            if profit_high >= 0.25: new_stop = max(new_stop, highest_seen * 0.90) 
         else:
-            if profit_high >= 0.20: new_stop = max(new_stop, highest_seen * 0.85) # בסיסי ענק נותנים לנשום
-            if profit_high >= 0.50: new_stop = max(new_stop, highest_seen * 0.82) 
+            # בתבניות מאקרו: ממש 50% מהכמות ברווח פסיכי של 25%, שחרר לשאר כבלים ארוכים!
+            if profit_high >= 0.25 and not scaled_out:
+                scaled_out = True
+                scale_out_price = entry_price * 1.25
+                new_stop = max(new_stop, entry_price * 1.05) 
+                
+            if profit_high >= 0.15: new_stop = max(new_stop, highest_seen * 0.88) # יכולה לתקן 12% מהשיא
+            if profit_high >= 0.40: new_stop = max(new_stop, highest_seen * 0.82) # מעל 40% רווח, יכולה לתקן 18%!
 
         stop_next_day = max(stop_today, new_stop)
 
@@ -383,7 +391,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks... (V50: Typo Fixed, Engine Ready)")
+    print(f"\nScanning {len(tickers)} stocks... (V51: The Expectancy Maximizer)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -403,7 +411,8 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
 
                     if pd.isna(spy_today["SMA_200"]) or pd.isna(spy_today["SMA_50"]) or pd.isna(spy_today["SMA_21"]): continue
 
-                    is_bull_or_recovering = float(spy_today["Close"]) > float(spy_today["SMA_50"])
+                    # שוחרר החנק! נאשר קניות ברגע שהשוק חזר מעל ממוצע 200 גם אם 50 עדיין למטה.
+                    is_bull_or_recovering = float(spy_today["Close"]) > float(spy_today["SMA_200"])
 
                     past_data = df[df.index <= current_date]
                     if len(past_data) < 310: continue
@@ -455,7 +464,9 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
 
                     atr = float(today["ATR_14"])
                     tight_low = float(pattern["tight_low"])
-                    calculated_stop = tight_low - (0.5 * atr) 
+                    
+                    # הקשחנו את הסטופ ל-0.2 ATR כדי לפתוח פוזיציות גדולות יותר מתמטית!
+                    calculated_stop = tight_low - (0.2 * atr) 
                     max_allowed_stop = entry_price * (1 - cfg.max_risk_pct)
                     initial_stop = max(calculated_stop, max_allowed_stop)
 
@@ -792,7 +803,7 @@ def save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, o
 
 def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.DataFrame, equity_df: pd.DataFrame, cfg: BacktestConfig):
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v50 - Engine Fixed & Core/Satellite)")
+    print("VCP BACKTEST REPORT (v51 - The Expectancy Maximizer)")
     print("=" * 80)
     
     if not yearly_df.empty:
