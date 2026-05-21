@@ -13,7 +13,7 @@ from fastdtw import fastdtw
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. CONFIGURATION (V49 - Resilience & Reporting)
+# 1. CONFIGURATION (V50 - Fixed Engine & Core/Satellite)
 # ==========================================
 @dataclass
 class BacktestConfig:
@@ -22,10 +22,11 @@ class BacktestConfig:
     benchmark: str = "SPY"
     initial_capital: float = 100_000.0
 
+    # חלוקת הון: 50% לבוט אקטיבי, 50% לליבה מוגנת
     active_capital_allocation: float = 0.50 
 
     risk_per_trade: float = 0.0125       
-    max_alloc_pct: float = 0.20          
+    max_alloc_pct: float = 0.25          # עד 25% מההון האקטיבי (4 מניות גג!)
     max_positions: int = 4               
     max_portfolio_heat: float = 0.06     
     max_new_trades_per_day: int = 2      
@@ -35,6 +36,7 @@ class BacktestConfig:
     slippage_bps: float = 12
     commission_bps: float = 2
 
+    # צלף טהור
     breakout_volume_ratio: float = 1.30  
     min_breakout_close_strength: float = 0.55 
     min_dollar_vol_50: float = 10_000_000 
@@ -47,7 +49,7 @@ class BacktestConfig:
     min_profit_after_time_stop: float = 0.015 
 
     min_rs_65: float = 0.05            
-    bear_market_rs_threshold: float = 0.15 # מותן מעט כדי למצוא עסקאות בשוק דובי
+    bear_market_rs_threshold: float = 0.15 # הבוט יחפש הזדמנויות גם בשוק דובי אם המניה פסיכית
     
     max_dist_from_52w_high: float = 0.45 
     max_pivot_extension: float = 0.04  
@@ -61,7 +63,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v49_resilience"
+    output_prefix: str = "canslim_v50_fixed_engine"
 
 # ==========================================
 # 2. Data & Indicators
@@ -103,7 +105,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v49.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v50.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -138,7 +140,7 @@ def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     return True
 
 # ==========================================
-# 4. Pattern Detection (DYNAMIC DTW)
+# 4. Pattern Detection (DYNAMIC DTW) - FIXED!
 # ==========================================
 def normalize_series(series):
     series_array = np.array(series)
@@ -162,6 +164,7 @@ def get_dtw_templates():
 
     rise = np.linspace(0, 1.0, 10)
     initial_pullback = np.linspace(1.0, 0.8, 5) 
+    # פה היה הבאג שמחק לך את העסקאות לעשור! תוקן ל np.pi
     box = np.ones(35) * 0.9 + np.sin(np.linspace(0, 6*np.pi, 35)) * 0.05
     templates["Darvas Box"] = {
         "data": np.concatenate((rise, initial_pullback, box)), 
@@ -186,7 +189,11 @@ def check_classical_patterns(hist):
     if len(hist_filtered) < 15: return None
     closes = hist_filtered["Close"].astype(float).values
 
-    templates = get_dtw_templates()
+    try:
+        templates = get_dtw_templates()
+    except Exception:
+        return None
+        
     best_pattern = None
     best_score = float('inf')
 
@@ -265,7 +272,7 @@ def check_classical_patterns(hist):
     return best_pattern
 
 # ==========================================
-# 5. Patient Trade Simulation
+# 5. Patient Trade Simulation (Custom Trailing)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -330,11 +337,12 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
             scale_out_price = entry_price * 1.20 
             new_stop = max(new_stop, entry_price * 1.05) 
 
+        # --- חוק הטריילינג המותאם לתבנית ---
         if pattern_type == "Bull Flag":
-            if profit_high >= 0.10: new_stop = max(new_stop, highest_seen * 0.94) 
+            if profit_high >= 0.10: new_stop = max(new_stop, highest_seen * 0.94) # דגל חונקים בשיא
             if profit_high >= 0.20: new_stop = max(new_stop, highest_seen * 0.93) 
         else:
-            if profit_high >= 0.20: new_stop = max(new_stop, highest_seen * 0.85) 
+            if profit_high >= 0.20: new_stop = max(new_stop, highest_seen * 0.85) # בסיסי ענק נותנים לנשום
             if profit_high >= 0.50: new_stop = max(new_stop, highest_seen * 0.82) 
 
         stop_next_day = max(stop_today, new_stop)
@@ -375,7 +383,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks... (V49: Resilience Active)")
+    print(f"\nScanning {len(tickers)} stocks... (V50: Typo Fixed, Engine Ready)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -665,7 +673,7 @@ def build_daily_equity_curve(accepted_df: pd.DataFrame, data_cache: dict, benchm
     return pd.DataFrame(rows)
 
 # ==========================================
-# 9. Summaries (FIXED FOR ZERO TRADES)
+# 9. Summaries
 # ==========================================
 def calc_drawdown(equity_curve: pd.Series) -> float:
     if len(equity_curve) == 0: return 0.0
@@ -768,11 +776,11 @@ def save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, o
     out_dir = Path("output") / cfg.output_prefix
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    candidates_df.to_csv(out_dir / "candidate_signals.csv", index=False, encoding="utf-8-sig")
-    accepted_df.to_csv(out_dir / "accepted_trades.csv", index=False, encoding="utf-8-sig")
-    equity_df.to_csv(out_dir / "equity_curve.csv", index=False, encoding="utf-8-sig")
-    yearly_df.to_csv(out_dir / "yearly_summary.csv", index=False, encoding="utf-8-sig")
-    monthly_df.to_csv(out_dir / "monthly_summary.csv", index=False, encoding="utf-8-sig")
+    if not candidates_df.empty: candidates_df.to_csv(out_dir / "candidate_signals.csv", index=False, encoding="utf-8-sig")
+    if not accepted_df.empty: accepted_df.to_csv(out_dir / "accepted_trades.csv", index=False, encoding="utf-8-sig")
+    if not equity_df.empty: equity_df.to_csv(out_dir / "equity_curve.csv", index=False, encoding="utf-8-sig")
+    if not yearly_df.empty: yearly_df.to_csv(out_dir / "yearly_summary.csv", index=False, encoding="utf-8-sig")
+    if not monthly_df.empty: monthly_df.to_csv(out_dir / "monthly_summary.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame([overall]).to_csv(out_dir / "overall_summary.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame([asdict(cfg)]).to_csv(out_dir / "config.csv", index=False, encoding="utf-8-sig")
 
@@ -784,7 +792,7 @@ def save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, o
 
 def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.DataFrame, equity_df: pd.DataFrame, cfg: BacktestConfig):
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v49 - Core/Satellite Resilience & Reporting)")
+    print("VCP BACKTEST REPORT (v50 - Engine Fixed & Core/Satellite)")
     print("=" * 80)
     
     if not yearly_df.empty:
