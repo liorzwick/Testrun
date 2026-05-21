@@ -13,7 +13,7 @@ from fastdtw import fastdtw
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. CONFIGURATION (Alpha Generator)
+# 1. CONFIGURATION (Hyper-Concentrated Sniper)
 # ==========================================
 @dataclass
 class BacktestConfig:
@@ -22,22 +22,22 @@ class BacktestConfig:
     benchmark: str = "SPY"
     initial_capital: float = 100_000.0
     
-    # ניהול הון וסיכון - משוחרר יותר כדי להיות מושקע
-    risk_per_trade: float = 0.0125       
-    max_alloc_pct: float = 0.20          
-    max_positions: int = 8               
-    max_portfolio_heat: float = 0.10     
-    max_new_trades_per_day: int = 4      # מותר לקנות עד 4 מניות ביום פריצה של השוק!
+    # ניהול הון וסיכון - צלף מרוכז
+    risk_per_trade: float = 0.015        # 1.5% סיכון לכל טרייד (אגרסיבי אך חכם)
+    max_alloc_pct: float = 0.25          # קונה עד 25% מהתיק במניה אחת (תיק מרוכז מאוד!)
+    max_positions: int = 6               # מספיקות 4-6 מניות כדי להיות חשוף במלואו
+    max_portfolio_heat: float = 0.12     # חשיפת סיכון כוללת של 12%
+    max_new_trades_per_day: int = 2      # "טעימת מים" חזרה לפעולה - מקסימום 2 ביום
     cooldown_days: int = 3               
     
     custom_tickers_file: str = "mystock.csv" 
     slippage_bps: float = 12
     commission_bps: float = 2
     
-    # --- שחרור רסן לאיתותים (V41) ---
-    breakout_volume_ratio: float = 1.15  # הורדנו מ-1.30 ל-1.15 (15% מעל הממוצע זה מספיק)
-    min_breakout_close_strength: float = 0.40 # הורדנו מ-0.55
-    min_dollar_vol_50: float = 10_000_000 # ירד ל-10M כדי להכניס מניות צמיחה קטנות יותר
+    # --- חזרה לחוקי הברזל (V40 Sniper Rules) ---
+    breakout_volume_ratio: float = 1.30  # מוסדיים בלבד
+    min_breakout_close_strength: float = 0.55 # סגירה חזקה בלבד
+    min_dollar_vol_50: float = 15_000_000 
     min_price: float = 8.0               
     
     min_risk_pct: float = 0.01         
@@ -47,7 +47,7 @@ class BacktestConfig:
     min_profit_after_time_stop: float = 0.015 
     
     min_rs_65: float = 0.03            
-    bear_market_rs_threshold: float = 0.25 # חריג שוק דובי
+    bear_market_rs_threshold: float = 0.25 
     
     max_dist_from_52w_high: float = 0.45 
     max_pivot_extension: float = 0.04  
@@ -61,7 +61,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v41_alpha_generator"
+    output_prefix: str = "canslim_v42_hyper_sniper"
 
 # ==========================================
 # 2. Data & Indicators
@@ -103,7 +103,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v41.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v42.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -138,7 +138,7 @@ def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     return True
 
 # ==========================================
-# 4. Pattern Detection (Relaxed DTW)
+# 4. Pattern Detection (STRICT DTW VISION)
 # ==========================================
 def normalize_series(series):
     series_array = np.array(series)
@@ -156,8 +156,8 @@ def get_dtw_templates():
     flag_waves = flag_trend + np.sin(np.linspace(0, 4*np.pi, 20)) * 0.05 
     templates["Bull Flag"] = {
         "data": np.concatenate((pole, flag_waves)), 
-        # הורדנו ל-0.80 במקום 0.88 - יביא הרבה יותר דגלים!
-        "windows": [20, 30, 45], "threshold": 0.15, "min_corr": 0.80, "comp": 0 
+        # חזרה ל-88% קורלציה (סינון הזבל!)
+        "windows": [20, 30, 45], "threshold": 0.12, "min_corr": 0.88, "comp": 0 
     }
 
     rise = np.linspace(0, 1.0, 10)
@@ -165,7 +165,7 @@ def get_dtw_templates():
     box = np.ones(35) * 0.9 + np.sin(np.linspace(0, 6*np.pi, 35)) * 0.05
     templates["Darvas Box"] = {
         "data": np.concatenate((rise, initial_pullback, box)), 
-        "windows": [40, 60, 90], "threshold": 0.15, "min_corr": 0.78, "comp": 1
+        "windows": [40, 60, 90], "threshold": 0.12, "min_corr": 0.85, "comp": 1
     }
 
     l_drop = np.linspace(1.0, 0.1, 15)  
@@ -174,7 +174,7 @@ def get_dtw_templates():
     r_up = np.linspace(0.0, 1.0, 15)    
     templates["Double Bottom"] = {
         "data": np.concatenate((l_drop, m_up, m_down, r_up)), 
-        "windows": [50, 80, 120, 180], "threshold": 0.18, "min_corr": 0.75, "comp": 2
+        "windows": [50, 80, 120, 180], "threshold": 0.15, "min_corr": 0.82, "comp": 2
     }
 
     left_cup = np.linspace(-1, 0, 45)**2
@@ -183,7 +183,7 @@ def get_dtw_templates():
     handle_waves = handle_trend + np.cos(np.linspace(0, 2*np.pi, 15)) * 0.03
     templates["Cup & Handle"] = {
         "data": np.concatenate((left_cup, right_cup, handle_waves)), 
-        "windows": [60, 90, 150, 250], "threshold": 0.18, "min_corr": 0.75, "comp": 2
+        "windows": [60, 90, 150, 250], "threshold": 0.15, "min_corr": 0.82, "comp": 2
     }
 
     return templates
@@ -377,11 +377,11 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
             "MAE_Pct": round((lowest_seen/max(entry_price, 1e-9)-1)*100, 2)}
 
 # ==========================================
-# 6. Candidate Generation (Lightning Fast + Bear Market Override)
+# 6. Candidate Generation
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks... (V41: The Alpha Generator Active)")
+    print(f"\nScanning {len(tickers)} stocks... (V42: Hyper-Concentrated Sniper Active)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -401,7 +401,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                     
                     if pd.isna(spy_today["SMA_200"]) or pd.isna(spy_today["SMA_50"]) or pd.isna(spy_today["SMA_21"]): continue
                     
-                    is_bull_or_recovering = float(spy_today["Close"]) > float(spy_today["SMA_50"])
+                    is_bull_or_recovering = float(spy_today["Close"]) > float(spy_today["SMA_50"]) and float(spy_today["Close"]) > float(spy_today["SMA_21"])
                     
                     past_data = df[df.index <= current_date]
                     if len(past_data) < 251: continue
@@ -412,7 +412,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
 
                     if not stock_filter_ok(today, cfg): continue
                     
-                    # 1. פילטרים מהירים לפני DTW (חיסכון זמן וריבוי איתותים!)
+                    # פילטרים מהירים וקפדניים (חזרה ל-1.30 ו-0.55 מגרסה 40)
                     vol_ratio = float(today["Volume"]) / max(float(today["Vol_50"]), 1e-9)
                     if vol_ratio < cfg.breakout_volume_ratio: continue
 
@@ -424,7 +424,6 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                     stock_rs_absolute = float(today["ROC_65"])
                     stock_rs_relative = stock_rs_absolute - spy_rs
                     
-                    # חריג מנהיגות השוק שלמדו מקורונה ו-2022
                     if not is_bull_or_recovering:
                         if stock_rs_relative < cfg.bear_market_rs_threshold:
                             continue 
@@ -504,7 +503,6 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
         entry_date = pd.Timestamp(cand["Entry_Date"])
         ticker = str(cand["Ticker"])
 
-        # לא יקנה יותר מ-4 מניות ביום אחד (מגן מקריסות אבל מאפשר מילוי תיק)
         if trades_by_date_count.get(entry_date, 0) >= cfg.max_new_trades_per_day:
             continue
 
@@ -768,7 +766,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v41 - Alpha Generator / Fully Invested)")
+    print("VCP BACKTEST REPORT (v42 - The Hyper-Concentrated Sniper)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
