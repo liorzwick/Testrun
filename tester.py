@@ -13,7 +13,7 @@ from fastdtw import fastdtw
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. CONFIGURATION (Pure Alpha Sniper)
+# 1. CONFIGURATION (Core & Satellite V47)
 # ==========================================
 @dataclass
 class BacktestConfig:
@@ -22,11 +22,14 @@ class BacktestConfig:
     benchmark: str = "SPY"
     initial_capital: float = 100_000.0
     
-    # ניהול הון מרוכז, קטלני ואגרסיבי למניות העל בלבד
-    risk_per_trade: float = 0.015        # 1.5% סיכון לטרייד (אגרוף פלדה)
-    max_alloc_pct: float = 0.25          # קונה עד 25% מהתיק למניה אחת!
-    max_positions: int = 5               # מקסימום 5 פוזיציות. תיק מרוכז שמייצר תשואת יתר.
-    max_portfolio_heat: float = 0.075    # 5 מניות כפול 1.5% סיכון = 7.5% מקסימום
+    # --- הפיצול (Core & Satellite) ---
+    active_capital_allocation: float = 0.50 # 50% מהכסף מיועד לבוט האגרסיבי (4 מניות), 50% במדד / מזומן מוגן
+    
+    # ניהול הון מרוכז ללוויין האגרסיבי (מחושב מתוך ה-50% שלו)
+    risk_per_trade: float = 0.015        # 1.5% סיכון פנימי לעסקה
+    max_alloc_pct: float = 0.25          # 25% מההון האקטיבי (כל מניה תתפוס 12.5% מהתיק הכולל)
+    max_positions: int = 4               # 4 מניות במקביל בדיוק כפי שביקשת!
+    max_portfolio_heat: float = 0.06     
     max_new_trades_per_day: int = 2      
     cooldown_days: int = 3               
     
@@ -34,9 +37,9 @@ class BacktestConfig:
     slippage_bps: float = 12
     commission_bps: float = 2
     
-    # חוקי סינון אכזריים (איכות על פני כמות)
-    breakout_volume_ratio: float = 1.30  # מוסדיים בלבד! לא יורדים מ-1.3
-    min_breakout_close_strength: float = 0.55 # סגירה חזקה
+    # חוקי סינון אכזריים (Pure Alpha) - בלי זבל!
+    breakout_volume_ratio: float = 1.30  
+    min_breakout_close_strength: float = 0.55 
     min_dollar_vol_50: float = 10_000_000 
     min_price: float = 8.0               
     
@@ -61,7 +64,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v46_pure_alpha"
+    output_prefix: str = "canslim_v47_holy_grail"
 
 # ==========================================
 # 2. Data & Indicators
@@ -103,7 +106,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v46.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v47.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -157,7 +160,7 @@ def get_dtw_templates():
     templates["Bull Flag"] = {
         "data": np.concatenate((pole, flag_waves)), 
         "windows": list(range(15, 66, 5)), 
-        "threshold": 0.12, "min_corr": 0.88, "comp": 0  # חזרה ל-88% קורלציה, אפס סובלנות לזבל
+        "threshold": 0.12, "min_corr": 0.88, "comp": 0 
     }
 
     rise = np.linspace(0, 1.0, 10)
@@ -265,7 +268,7 @@ def check_classical_patterns(hist):
     return best_pattern
 
 # ==========================================
-# 5. Patient Trade Simulation (WIDE RUNNERS)
+# 5. Patient Trade Simulation
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -373,7 +376,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks... (V46: Pure Alpha Sniper Active)")
+    print(f"\nScanning {len(tickers)} stocks... (V47: Core & Satellite Active)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -474,7 +477,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     return pd.DataFrame(candidates).sort_values(["Entry_Date", "Volume_Ratio"], ascending=[True, False]).reset_index(drop=True)
 
 # ==========================================
-# 7. Portfolio Management
+# 7. Portfolio Management (Active Satellite)
 # ==========================================
 def get_close_on_or_before(df: pd.DataFrame, dt: pd.Timestamp, fallback: float) -> float:
     x = df[df.index <= dt]
@@ -483,7 +486,9 @@ def get_close_on_or_before(df: pd.DataFrame, dt: pd.Timestamp, fallback: float) 
 def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dict, cfg: BacktestConfig) -> pd.DataFrame:
     if candidates.empty: return pd.DataFrame()
 
-    cash = cfg.initial_capital
+    # הון התחלתי לפלוגת הלוויין בלבד! (50,000$ בדוגמה שלנו)
+    cash = cfg.initial_capital * cfg.active_capital_allocation
+    
     active = []
     accepted = []
     last_exit_by_ticker = {}
@@ -581,63 +586,92 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
     return pd.DataFrame(accepted).sort_values(["Entry_Date", "Exit_Date", "Ticker"]).reset_index(drop=True)
 
 # ==========================================
-# 8. Daily Equity Curve (PURE CASH, NO SPY!)
+# 8. Daily Equity Curve (Core & Satellite)
 # ==========================================
 def build_daily_equity_curve(accepted_df: pd.DataFrame, data_cache: dict, benchmark_df: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
-    if accepted_df.empty:
-        return pd.DataFrame(columns=["Date", "Cash", "Market_Value", "Equity", "Drawdown_Pct", "Open_Positions"])
-
     start_dt = pd.Timestamp(f"{cfg.start_year}-01-01")
     end_dt = pd.Timestamp(f"{cfg.end_year}-12-31")
 
-    accepted_records = accepted_df.to_dict("records")
-    trade_dates = [pd.Timestamp(r["Entry_Date"]) for r in accepted_records] + [pd.Timestamp(r["Exit_Date"]) for r in accepted_records]
+    # הכנת נתוני המדד למערכת הליבה (Core) ללא "הצצה לעתיד"
+    benchmark_df = benchmark_df.copy()
+    benchmark_df['SMA_200'] = benchmark_df['Close'].rolling(200).mean()
+    benchmark_df['Is_Safe'] = benchmark_df['Close'] > benchmark_df['SMA_200']
+    
+    # האם מותר להרוויח היום מהמדד? כן, רק אם ה-SPY סגר *אתמול* מעל ממוצע 200
+    benchmark_df['Earn_Return_Today'] = benchmark_df['Is_Safe'].shift(1).fillna(False)
+    benchmark_df['Daily_Return'] = benchmark_df['Close'].pct_change().fillna(0)
+    spy_data = benchmark_df.to_dict('index')
+
+    if accepted_df.empty:
+        trade_dates = []
+    else:
+        accepted_records = accepted_df.to_dict("records")
+        trade_dates = [pd.Timestamp(r["Entry_Date"]) for r in accepted_records] + [pd.Timestamp(r["Exit_Date"]) for r in accepted_records]
+    
     base_calendar = benchmark_df.index
     full_calendar = base_calendar.union(pd.DatetimeIndex(trade_dates)).drop_duplicates().sort_values()
     calendar = full_calendar[(full_calendar >= start_dt) & (full_calendar <= end_dt)]
 
     entries_by_date, exits_by_date = {}, {}
-    for r in accepted_records:
-        entries_by_date.setdefault(pd.Timestamp(r["Entry_Date"]), []).append(r)
-        exits_by_date.setdefault(pd.Timestamp(r["Exit_Date"]), []).append(r)
+    if not accepted_df.empty:
+        for r in accepted_records:
+            entries_by_date.setdefault(pd.Timestamp(r["Entry_Date"]), []).append(r)
+            exits_by_date.setdefault(pd.Timestamp(r["Exit_Date"]), []).append(r)
 
-    cash = cfg.initial_capital
+    # חלוקת הכספים
+    active_cash = cfg.initial_capital * cfg.active_capital_allocation
+    core_equity = cfg.initial_capital * (1.0 - cfg.active_capital_allocation)
+    
     open_pos, rows = {}, []
     running_peak = cfg.initial_capital
 
     for dt in calendar:
+        # 1. ניהול הליבה (Core)
+        spy_row = spy_data.get(dt)
+        if spy_row and spy_row['Earn_Return_Today']:
+            core_equity *= (1 + spy_row['Daily_Return'])
+            
+        # 2. ניהול הלוויין (Satellite)
         if cfg.allow_same_day_cash_reuse:
             for r in exits_by_date.get(dt, []):
                 key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
                 if key in open_pos:
-                    cash += float(r["Gross_Exit"]) - float(r["Exit_Fee"])
+                    active_cash += float(r["Gross_Exit"]) - float(r["Exit_Fee"])
                     del open_pos[key]
             for r in entries_by_date.get(dt, []):
                 key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
                 open_pos[key] = r
-                cash -= float(r["Gross_Entry"]) + float(r["Entry_Fee"])
+                active_cash -= float(r["Gross_Entry"]) + float(r["Entry_Fee"])
         else:
             for r in entries_by_date.get(dt, []):
                 key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
                 open_pos[key] = r
-                cash -= float(r["Gross_Entry"]) + float(r["Entry_Fee"])
+                active_cash -= float(r["Gross_Entry"]) + float(r["Entry_Fee"])
             for r in exits_by_date.get(dt, []):
                 key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
                 if key in open_pos:
-                    cash += float(r["Gross_Exit"]) - float(r["Exit_Fee"])
+                    active_cash += float(r["Gross_Exit"]) - float(r["Exit_Fee"])
                     del open_pos[key]
 
         market_value = sum(
             get_close_on_or_before(data_cache[pos["Ticker"]], dt, float(pos["Entry_Price"])) * float(pos["Shares"])
             for pos in open_pos.values()
         )
-        equity = cash + market_value
-        running_peak = max(running_peak, equity)
-        dd = (equity / running_peak - 1.0) * 100 if running_peak > 0 else 0.0
+        
+        active_equity = active_cash + market_value
+        total_equity = active_equity + core_equity
+        
+        running_peak = max(running_peak, total_equity)
+        dd = (total_equity / running_peak - 1.0) * 100 if running_peak > 0 else 0.0
 
         rows.append({
-            "Date": dt, "Cash": round(cash, 2), "Market_Value": round(market_value, 2),
-            "Equity": round(equity, 2), "Drawdown_Pct": round(dd, 2), "Positions": len(open_pos),
+            "Date": dt, 
+            "Active_Cash": round(active_cash, 2), 
+            "Core_Equity": round(core_equity, 2),
+            "Active_Market_Value": round(market_value, 2),
+            "Equity": round(total_equity, 2), 
+            "Drawdown_Pct": round(dd, 2), 
+            "Positions": len(open_pos),
         })
 
     return pd.DataFrame(rows)
@@ -752,22 +786,28 @@ def save_outputs(candidates_df, accepted_df, equity_df, yearly_df, monthly_df, o
         
     print(f"\nFiles saved -> {out_dir}/")
 
-def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.DataFrame):
+def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.DataFrame, equity_df: pd.DataFrame, cfg: BacktestConfig):
     if not overall or overall.get('Trades', 0) == 0:
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v46 - Pure Alpha Sniper)")
+    print("VCP BACKTEST REPORT (v47 - Core & Satellite | Protected SPY)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
     print("-" * 80)
-    print(f" Total Trades  : {overall['Trades']}")
-    print(f" Win Rate      : {overall['Win_Rate_Pct']}%")
-    print(f" Avg Trade     : {overall['Avg_Trade_Pct']}%")
-    print(f" Total Return  : {overall['Total_Return_Pct']}%")
-    print(f" Max Drawdown  : {overall['Max_Drawdown_Pct']}%")
-    print(f" Net PnL       : ${overall.get('Net_PnL', 0):,.0f}")
+    print(f" Total Trades       : {overall['Trades']}")
+    print(f" Win Rate           : {overall['Win_Rate_Pct']}%")
+    print(f" Avg Trade          : {overall['Avg_Trade_Pct']}%")
+    print(f" Max Drawdown       : {overall['Max_Drawdown_Pct']}%")
+    print(f" --------------------------------")
+    
+    total_final_equity = equity_df["Equity"].iloc[-1] if not equity_df.empty else cfg.initial_capital
+    total_pnl = total_final_equity - cfg.initial_capital
+    
+    print(f" Active Trade PnL   : ${overall.get('Net_PnL', 0):,.0f} (From {int(cfg.initial_capital * cfg.active_capital_allocation):,} starting capital)")
+    print(f" 🏆 TOTAL PORTFOLIO PnL : ${total_pnl:,.0f} (Active + Protected Core)")
+    print(f" 📈 TOTAL RETURN        : {overall['Total_Return_Pct']}%")
     
     print("\n--- PERFORMANCE BY PATTERN TYPE ---")
     stats = calculate_pattern_success(accepted_df)
@@ -827,4 +867,4 @@ if __name__ == "__main__":
     tickers = get_tickers(cfg)
     cands, acc, eq, yearly, monthly, overall = run_backtest_engine(tickers, cfg)
     save_outputs(cands, acc, eq, yearly, monthly, overall, cfg)
-    print_final_report(overall, yearly, acc)
+    print_final_report(overall, yearly, acc, eq, cfg)
