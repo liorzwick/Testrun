@@ -13,7 +13,7 @@ from fastdtw import fastdtw
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. CONFIGURATION (Deep Time Vision)
+# 1. CONFIGURATION (Pure Alpha + Cash Yield)
 # ==========================================
 @dataclass
 class BacktestConfig:
@@ -32,6 +32,9 @@ class BacktestConfig:
     custom_tickers_file: str = "mystock.csv" 
     slippage_bps: float = 12
     commission_bps: float = 2
+    
+    # --- הזרקת התשואה על המזומן (Risk-Free Rate) ---
+    risk_free_rate: float = 0.045        # 4.5% ריבית שנתית (כמו אג"ח קצר/קרן כספית) על המזומן בעו"ש
     
     breakout_volume_ratio: float = 1.30  
     min_breakout_close_strength: float = 0.55 
@@ -59,7 +62,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v44_deep_time"
+    output_prefix: str = "canslim_v54_yield_maximized"
 
 # ==========================================
 # 2. Data & Indicators
@@ -101,7 +104,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v44.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v54.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -154,7 +157,6 @@ def get_dtw_templates():
     flag_waves = flag_trend + np.sin(np.linspace(0, 4*np.pi, 20)) * 0.05 
     templates["Bull Flag"] = {
         "data": np.concatenate((pole, flag_waves)), 
-        # הורחב עד 65 ימים (כ-13 שבועות מסחר)
         "windows": list(range(15, 66, 5)), 
         "threshold": 0.12, "min_corr": 0.88, "comp": 0 
     }
@@ -164,7 +166,6 @@ def get_dtw_templates():
     box = np.ones(35) * 0.9 + np.sin(np.linspace(0, 6*np.pi, 35)) * 0.05
     templates["Darvas Box"] = {
         "data": np.concatenate((rise, initial_pullback, box)), 
-        # הורחב מ-90 יום ל-150 ימים (כחצי שנה)
         "windows": list(range(25, 151, 10)), 
         "threshold": 0.12, "min_corr": 0.85, "comp": 1
     }
@@ -175,7 +176,6 @@ def get_dtw_templates():
     handle_waves = handle_trend + np.cos(np.linspace(0, 2*np.pi, 15)) * 0.03
     templates["Cup & Handle"] = {
         "data": np.concatenate((left_cup, right_cup, handle_waves)), 
-        # הורחב מ-200 יום ל-300 ימים (כ-60 שבועות מסחר)
         "windows": list(range(40, 301, 15)), 
         "threshold": 0.15, "min_corr": 0.82, "comp": 2
     }
@@ -374,7 +374,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks... (V44: Deep Time Vision Active)")
+    print(f"\nScanning {len(tickers)} stocks... (V54: Yield Maximized Active)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -397,7 +397,6 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                     is_bull_or_recovering = float(spy_today["Close"]) > float(spy_today["SMA_50"])
                     
                     past_data = df[df.index <= current_date]
-                    # תיקון לגרסה 44: דורשים לפחות 310 ימי היסטוריה כדי לסרוק ספל של 300 יום!
                     if len(past_data) < 310: continue
 
                     today = past_data.iloc[-1]
@@ -606,8 +605,14 @@ def build_daily_equity_curve(accepted_df: pd.DataFrame, data_cache: dict, benchm
     cash = cfg.initial_capital
     open_pos, rows = {}, []
     running_peak = cfg.initial_capital
+    
+    # 4.5% ריבית חסרת סיכון יומית מחושבת להעלמת אפקט ה-Cash Drag!
+    daily_rf_rate = getattr(cfg, 'risk_free_rate', 0.045) / 252.0
 
     for dt in calendar:
+        # הפקדת ריבית יומית על כל דולר שאינו מושקע כרגע במניה
+        cash = cash * (1 + daily_rf_rate)
+        
         if cfg.allow_same_day_cash_reuse:
             for r in exits_by_date.get(dt, []):
                 key = (r["Ticker"], pd.Timestamp(r["Entry_Date"]), pd.Timestamp(r["Exit_Date"]))
@@ -759,7 +764,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v44 - Deep Time Vision)")
+    print("VCP BACKTEST REPORT (v54 - Yield Maximized & Deep Time Vision)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
