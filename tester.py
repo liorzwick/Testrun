@@ -13,7 +13,7 @@ from fastdtw import fastdtw
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. CONFIGURATION (V52 - Restored Masterpiece)
+# 1. CONFIGURATION (Deep Time Vision)
 # ==========================================
 @dataclass
 class BacktestConfig:
@@ -22,19 +22,17 @@ class BacktestConfig:
     benchmark: str = "SPY"
     initial_capital: float = 100_000.0
     
-    # חזרה לכוח אש מלא: 100% מנוהל על ידי הבוט (ללא חלוקת ליבה/לוויין)
-    risk_per_trade: float = 0.015        # 1.5% סיכון קלאסי
-    max_alloc_pct: float = 0.25          # קונה עד 25% מהתיק למניה 
-    max_positions: int = 5               # מקסימום 5 פוזיציות
-    max_portfolio_heat: float = 0.075    
-    max_new_trades_per_day: int = 2      
+    risk_per_trade: float = 0.0125       
+    max_alloc_pct: float = 0.20          
+    max_positions: int = 8               
+    max_portfolio_heat: float = 0.10     
+    max_new_trades_per_day: int = 3      
     cooldown_days: int = 3               
     
     custom_tickers_file: str = "mystock.csv" 
     slippage_bps: float = 12
     commission_bps: float = 2
     
-    # חוקי סינון קומנדו (בלי זבל)
     breakout_volume_ratio: float = 1.30  
     min_breakout_close_strength: float = 0.55 
     min_dollar_vol_50: float = 10_000_000 
@@ -61,7 +59,7 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v52_restored"
+    output_prefix: str = "canslim_v44_deep_time"
 
 # ==========================================
 # 2. Data & Indicators
@@ -103,7 +101,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v52.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v44.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -138,7 +136,7 @@ def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     return True
 
 # ==========================================
-# 4. Pattern Detection (DYNAMIC DTW - FIXED np.pi)
+# 4. Pattern Detection (DEEP TIME WINDOWS)
 # ==========================================
 def normalize_series(series):
     series_array = np.array(series)
@@ -156,6 +154,7 @@ def get_dtw_templates():
     flag_waves = flag_trend + np.sin(np.linspace(0, 4*np.pi, 20)) * 0.05 
     templates["Bull Flag"] = {
         "data": np.concatenate((pole, flag_waves)), 
+        # הורחב עד 65 ימים (כ-13 שבועות מסחר)
         "windows": list(range(15, 66, 5)), 
         "threshold": 0.12, "min_corr": 0.88, "comp": 0 
     }
@@ -165,6 +164,7 @@ def get_dtw_templates():
     box = np.ones(35) * 0.9 + np.sin(np.linspace(0, 6*np.pi, 35)) * 0.05
     templates["Darvas Box"] = {
         "data": np.concatenate((rise, initial_pullback, box)), 
+        # הורחב מ-90 יום ל-150 ימים (כחצי שנה)
         "windows": list(range(25, 151, 10)), 
         "threshold": 0.12, "min_corr": 0.85, "comp": 1
     }
@@ -175,6 +175,7 @@ def get_dtw_templates():
     handle_waves = handle_trend + np.cos(np.linspace(0, 2*np.pi, 15)) * 0.03
     templates["Cup & Handle"] = {
         "data": np.concatenate((left_cup, right_cup, handle_waves)), 
+        # הורחב מ-200 יום ל-300 ימים (כ-60 שבועות מסחר)
         "windows": list(range(40, 301, 15)), 
         "threshold": 0.15, "min_corr": 0.82, "comp": 2
     }
@@ -186,11 +187,7 @@ def check_classical_patterns(hist):
     if len(hist_filtered) < 15: return None
     closes = hist_filtered["Close"].astype(float).values
     
-    try:
-        templates = get_dtw_templates()
-    except Exception:
-        return None
-        
+    templates = get_dtw_templates()
     best_pattern = None
     best_score = float('inf')
 
@@ -269,7 +266,7 @@ def check_classical_patterns(hist):
     return best_pattern
 
 # ==========================================
-# 5. Patient Trade Simulation (Restored 33% Scale-Out)
+# 5. Patient Trade Simulation (WIDE RUNNERS)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
@@ -289,7 +286,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
     
     scaled_out = False
     scale_out_price = 0.0
-    scale_out_pct = 0.33 # חזרנו למכירת 33% כדי להשאיר בשר למגמה 
+    scale_out_pct = 0.33 
 
     for i, row in enumerate(future.itertuples()):
         dt = row.Index
@@ -334,8 +331,10 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
             scale_out_price = entry_price * 1.20 
             new_stop = max(new_stop, entry_price * 1.05) 
             
-        if profit_high >= 0.20: new_stop = max(new_stop, highest_seen * 0.85) 
-        if profit_high >= 0.50: new_stop = max(new_stop, highest_seen * 0.82) 
+        if profit_high >= 0.20: 
+            new_stop = max(new_stop, highest_seen * 0.85) 
+        if profit_high >= 0.50: 
+            new_stop = max(new_stop, highest_seen * 0.82) 
 
         stop_next_day = max(stop_today, new_stop)
 
@@ -375,7 +374,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks... (V52: Restoring Pure Alpha)")
+    print(f"\nScanning {len(tickers)} stocks... (V44: Deep Time Vision Active)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -398,6 +397,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                     is_bull_or_recovering = float(spy_today["Close"]) > float(spy_today["SMA_50"])
                     
                     past_data = df[df.index <= current_date]
+                    # תיקון לגרסה 44: דורשים לפחות 310 ימי היסטוריה כדי לסרוק ספל של 300 יום!
                     if len(past_data) < 310: continue
 
                     today = past_data.iloc[-1]
@@ -759,7 +759,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v52 - Restored Masterpiece | 100% Active)")
+    print("VCP BACKTEST REPORT (v44 - Deep Time Vision)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
