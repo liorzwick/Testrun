@@ -13,7 +13,7 @@ from fastdtw import fastdtw
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. CONFIGURATION (V55 - Restored Alpha + Yield)
+# 1. CONFIGURATION (V56 - The True Yield Maximizer)
 # ==========================================
 @dataclass
 class BacktestConfig:
@@ -22,11 +22,11 @@ class BacktestConfig:
     benchmark: str = "SPY"
     initial_capital: float = 100_000.0
     
-    # --- ההגדרות המנצחות שהחזירו לך 147% ---
-    risk_per_trade: float = 0.015        
-    max_alloc_pct: float = 0.25          # 25% למניה!
-    max_positions: int = 4               # 4 מניות במקביל (קומנדו)
-    max_portfolio_heat: float = 0.06     
+    # --- שחזור ההגדרות המנצחות של ה-147% ---
+    risk_per_trade: float = 0.0125       
+    max_alloc_pct: float = 0.20          
+    max_positions: int = 8               
+    max_portfolio_heat: float = 0.10     
     max_new_trades_per_day: int = 3      
     cooldown_days: int = 3               
     
@@ -34,22 +34,17 @@ class BacktestConfig:
     slippage_bps: float = 12
     commission_bps: float = 2
     
-    # --- הוספת הקרן הכספית על המזומן ---
-    risk_free_rate: float = 0.045        # 4.5% תשואה שנתית על מזומן פנוי
-    
-    # --- חוקי הפריצה המשוחררים (יותר איתותים) ---
-    breakout_volume_ratio: float = 1.20  
-    min_breakout_close_strength: float = 0.50 
+    # --- הפילטרים המקוריים (אפס פשרות על איכות) ---
+    breakout_volume_ratio: float = 1.30  
+    min_breakout_close_strength: float = 0.55 
     min_dollar_vol_50: float = 10_000_000 
     min_price: float = 8.0               
     
     min_risk_pct: float = 0.01         
     max_risk_pct: float = 0.12         
     max_hold_bars: int = 150           
-    
-    # שחרור חנק הזמן
-    time_stop_bars: int = 25           
-    min_profit_after_time_stop: float = 0.0 
+    time_stop_bars: int = 18           
+    min_profit_after_time_stop: float = 0.015 
     
     min_rs_65: float = 0.05            
     bear_market_rs_threshold: float = 0.25 
@@ -66,7 +61,10 @@ class BacktestConfig:
     raw_price_mode: bool = False
     allow_same_day_cash_reuse: bool = False
     universe_file: str | None = None
-    output_prefix: str = "canslim_v55_restored_yield"
+    output_prefix: str = "canslim_v56_true_yield"
+    
+    # --- תוספת היעילות הפיננסית: ריבית על המזומן ---
+    risk_free_rate: float = 0.045
 
 # ==========================================
 # 2. Data & Indicators
@@ -108,7 +106,7 @@ def get_data(ticker: str, start_fetch: str, end_fetch: str, cfg: BacktestConfig,
     cache_dir = Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
     price_tag = "raw" if cfg.raw_price_mode else "adj"
-    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v55.pkl"
+    cache_file = cache_dir / f"{ticker}_{start_fetch}_{end_fetch}_{price_tag}_v56.pkl"
 
     if cache_file.exists():
         try: return pd.read_pickle(cache_file)
@@ -143,7 +141,7 @@ def stock_filter_ok(today: pd.Series, cfg: BacktestConfig) -> bool:
     return True
 
 # ==========================================
-# 4. Pattern Detection (DEEP TIME WINDOWS)
+# 4. Pattern Detection
 # ==========================================
 def normalize_series(series):
     series_array = np.array(series)
@@ -274,14 +272,14 @@ def check_classical_patterns(hist):
     return best_pattern
 
 # ==========================================
-# 5. Patient Trade Simulation (CUSTOM TRAILING)
+# 5. Patient Trade Simulation (המנגנון החלק והמנצח)
 # ==========================================
 def classify_pnl(pct: float) -> str:
     if pct > 0: return "Win"
     if pct < 0: return "Loss"
     return "Flat"
 
-def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: float, initial_stop: float, pattern_type: str, cfg: BacktestConfig):
+def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: float, initial_stop: float, cfg: BacktestConfig):
     future = df[df.index >= entry_date].head(cfg.max_hold_bars)
     if future.empty: return None
 
@@ -339,12 +337,10 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
             scale_out_price = entry_price * 1.20 
             new_stop = max(new_stop, entry_price * 1.05) 
             
-        if pattern_type == "Bull Flag":
-            if profit_high >= 0.10: new_stop = max(new_stop, highest_seen * 0.94) 
-            if profit_high >= 0.20: new_stop = max(new_stop, highest_seen * 0.93) 
-        else:
-            if profit_high >= 0.20: new_stop = max(new_stop, highest_seen * 0.85) 
-            if profit_high >= 0.50: new_stop = max(new_stop, highest_seen * 0.82) 
+        if profit_high >= 0.20: 
+            new_stop = max(new_stop, highest_seen * 0.85) 
+        if profit_high >= 0.50: 
+            new_stop = max(new_stop, highest_seen * 0.82) 
 
         stop_next_day = max(stop_today, new_stop)
 
@@ -384,7 +380,7 @@ def simulate_trade(df: pd.DataFrame, entry_date: pd.Timestamp, entry_price: floa
 # ==========================================
 def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
     candidates = []
-    print(f"\nScanning {len(tickers)} stocks... (V55: Restored Masterpiece)")
+    print(f"\nScanning {len(tickers)} stocks... (V56: Perfect Engine + Yield)")
 
     for year in tqdm(range(cfg.start_year, cfg.end_year + 1), desc="Years"):
         test_start = pd.Timestamp(f"{year}-01-01")
@@ -463,7 +459,7 @@ def generate_candidate_trades(tickers, data_cache, spy_df, cfg: BacktestConfig):
                     risk_pct = (entry_price - initial_stop) / max(entry_price, 1e-9)
                     if not (cfg.min_risk_pct <= risk_pct <= cfg.max_risk_pct): continue
 
-                    sim = simulate_trade(df, entry_date, entry_price, initial_stop, pattern["type"], cfg)
+                    sim = simulate_trade(df, entry_date, entry_price, initial_stop, cfg)
                     if sim is None: continue
 
                     candidates.append({
@@ -592,7 +588,7 @@ def accept_trades_with_portfolio_rules(candidates: pd.DataFrame, data_cache: dic
     return pd.DataFrame(accepted).sort_values(["Entry_Date", "Exit_Date", "Ticker"]).reset_index(drop=True)
 
 # ==========================================
-# 8. Daily Equity Curve (WITH RISK-FREE YIELD)
+# 8. Daily Equity Curve (השינוי היחיד! תוספת ריבית על עו"ש)
 # ==========================================
 def build_daily_equity_curve(accepted_df: pd.DataFrame, data_cache: dict, benchmark_df: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
     if accepted_df.empty:
@@ -616,11 +612,11 @@ def build_daily_equity_curve(accepted_df: pd.DataFrame, data_cache: dict, benchm
     open_pos, rows = {}, []
     running_peak = cfg.initial_capital
     
-    # 4.5% ריבית חסרת סיכון על המזומן הפנוי (קרן כספית / T-Bills)
-    daily_rf_rate = getattr(cfg, 'risk_free_rate', 0.045) / 252.0
+    # חישוב הריבית היומית (Risk-Free) על המזומן שלא מושקע בעסקאות
+    daily_rf_rate = cfg.risk_free_rate / 252.0
 
     for dt in calendar:
-        # כל דולר שלא מושקע כרגע במניה מרוויח אוטומטית ריבית יומית של קרן כספית
+        # כל דולר של מזומן מרוויח אוטומטית ריבית יומית 
         cash = cash * (1 + daily_rf_rate)
         
         if cfg.allow_same_day_cash_reuse:
@@ -774,7 +770,7 @@ def print_final_report(overall: dict, yearly_df: pd.DataFrame, accepted_df: pd.D
         print("No trades executed.")
         return
     print("\n" + "=" * 80)
-    print("VCP BACKTEST REPORT (v55 - Restored Alpha + Yield Maximized)")
+    print("VCP BACKTEST REPORT (v56 - True Yield Maximizer)")
     print("=" * 80)
     for _, r in yearly_df.iterrows():
         print(f" {int(r['Year'])}: trades={int(r['Trades']):3d} | WR={r['Win_Rate_Pct']:5.1f}% | avgTrade={r['Avg_Trade_Pct']:+5.2f}% | ret={r['Total_Return_Pct']:+6.2f}% | MDD={r['Max_Drawdown_Pct']:5.2f}%")
